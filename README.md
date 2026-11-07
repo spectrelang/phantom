@@ -2,6 +2,12 @@
 
 Phantom is a <a href="https://spectrelang.org">Spectre</a> debugger with a native (DWARF, Linux x86_64) and LLDB backend.
 
+## Installation
+
+```sh
+spectre install https://github.com/spectrelang/phantom.git
+```
+
 ## Quick start
 
 Given `hi.sx`:
