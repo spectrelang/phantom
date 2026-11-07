@@ -46,6 +46,44 @@ pub fn load(arena: allocators.Arena, path: ref u8) result[ref Target, ref u8] = 
     return ok t
 }
 
+/// Create an empty target for backends that do not need ELF/DWARF metadata
+/// (for example LLDB on Mach-O or PE binaries).
+pub fn empty(arena: allocators.Arena, path: ref u8) ref Target = trust {
+    val e: mut ref elf.ElfFile = allocators.Arena.alloc_or_none(
+        arena,
+        @sizeof(elf.ElfFile) as usize
+    ) as ref elf.ElfFile
+    @memset(e, 0, @sizeof(elf.ElfFile) as usize)
+    e.path = path
+    e.sections = @listalloc[allocators.HeapAllocator, ref elf.ElfSection](util.heap())?
+    e.symbols = @listalloc[allocators.HeapAllocator, ref elf.ElfSymbol](util.heap())?
+
+    val d: mut ref dwarf.DwarfInfo = allocators.Arena.alloc_or_none(
+        arena,
+        @sizeof(dwarf.DwarfInfo) as usize
+    ) as ref dwarf.DwarfInfo
+    @memset(d, 0, @sizeof(dwarf.DwarfInfo) as usize)
+    d.elf = e
+    d.arena = arena
+    d.cus = @listalloc[allocators.HeapAllocator, ref dwarf.DwarfCu](util.heap())?
+    d.dies = @listalloc[allocators.HeapAllocator, ref dwarf.DwarfDie](util.heap())?
+    d.functions = @listalloc[allocators.HeapAllocator, ref dwarf.DwarfFunction](util.heap())?
+    d.variables = @listalloc[allocators.HeapAllocator, ref dwarf.DwarfVariable](util.heap())?
+    d.types = @listalloc[allocators.HeapAllocator, ref dwarf.DwarfType](util.heap())?
+    d.lines = @listalloc[allocators.HeapAllocator, ref dwarf.DwarfLineRow](util.heap())?
+    d.files = @listalloc[allocators.HeapAllocator, ref u8](util.heap())?
+
+    val t: mut ref Target = allocators.Arena.alloc_or_none(
+        arena,
+        @sizeof(Target) as usize
+    ) as ref Target
+    @memset(t, 0, @sizeof(Target) as usize)
+    t.path = path
+    t.elf_file = e
+    t.dwarf_info = d
+    return t
+}
+
 /// Resolve a function name to its raw symbol, or empty when not found.
 pub fn function_raw(t: ref Target, query: ref u8) ref u8 = trust {
     val f: ref dwarf.DwarfFunction = dwarf.find_function(t.dwarf_info, query)

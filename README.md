@@ -151,6 +151,13 @@ Supported requests include `initialize`, `launch`, `setBreakpoints`,
 `next` / `stepIn` / `stepOut` (LLDB only), `stackTrace`, `scopes`,
 `variables`, `evaluate`, and `disconnect`.
 
+## Platform support
+
+Phantom builds on Linux, macOS (aarch64 and x86_64), and Windows. The LLDB
+backend is available on all three. The native DWARF/ptrace backend, the ELF
+symbol reader, and the `symbols` / `lines` / `variables` inspection commands
+are Linux-specific.
+
 ## Native backend scope
 
 The native backend currently supports:
@@ -169,8 +176,8 @@ unwinding. Use the LLDB backend if those are really needed.
 Unit tests live next to the code they cover:
 
 ```sh
-spectre src/demangle.sx -alt -test
-spectre src/lldb.sx -alt -test
-spectre src/cli.sx -alt -test
-spectre src/main.sx -alt -test
+spectre src/demangle.sx -test
+spectre src/lldb.sx -test
+spectre src/cli.sx -test
+spectre src/main.sx -test
 ```

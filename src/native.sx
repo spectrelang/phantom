@@ -11,7 +11,7 @@ val elf        = use("elf.sx")
 val dwarf      = use("dwarf.sx")
 val demangle   = use("demangle.sx")
 
-when linux {
+when posix {
     extern "sys/ptrace.h"
     extern "sys/wait.h"
     extern "signal.h"
@@ -26,9 +26,49 @@ when linux {
     extern (C, header) fn pread(fd: i32, buf: ref void, count: usize, offset: i64) i64 = "pread"
     extern (C, header) fn pwrite(fd: i32, buf: ref void, count: usize, offset: i64) i64 = "pwrite"
     extern (C, header) fn close(fd: i32) i32 = "close"
+}
+
+when linux {
     extern (C) fn __errno_location() ref i32 = "__errno_location"
 }
 
+when windows {
+    fn fork() i32 = trust {
+        return -1
+    }
+    fn dup2(_: i32, _: i32) i32 = trust {
+        return -1
+    }
+    fn execvp(_: ref u8, _: ref ref u8) i32 = trust {
+        return -1
+    }
+    fn _exit(_: i32) void = trust {
+    }
+    fn ptrace(_: i64, _: i32, _: ref void, _: ref void) i64 = trust {
+        return -1
+    }
+    fn waitpid(_: i32, _: ref i32, _: i32) i32 = trust {
+        return -1
+    }
+    fn kill(_: i32, _: i32) i32 = trust {
+        return -1
+    }
+    fn open(_: ref u8, _: i32) i32 = trust {
+        return -1
+    }
+    fn pread(_: i32, _: ref void, _: usize, _: i64) i64 = trust {
+        return -1
+    }
+    fn pwrite(_: i32, _: ref void, _: usize, _: i64) i64 = trust {
+        return -1
+    }
+    fn close(_: i32) i32 = trust {
+        return -1
+    }
+    fn __errno_location() ref i32 = trust {
+        return none
+    }
+}
 val PTRACE_TRACEME: i64 = 0
 val PTRACE_PEEKTEXT: i64 = 1
 val PTRACE_PEEKDATA: i64 = 2

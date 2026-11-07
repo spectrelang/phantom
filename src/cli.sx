@@ -601,11 +601,11 @@ fn set_lldb_breakpoint(
         }
     }
     val raw: ref u8 = target.function_raw(t, query)
-    if string.len_raw(raw) == 0 {
-        stdio.print("phantom: no function matching '{s}'\n", {query})
-        return
+    val name: mut ref u8 = raw
+    if string.len_raw(name) == 0 {
+        name = query
     }
-    val out2: ref u8 = lldb.clean_output(lldb.breakpoint_symbol(s, raw))
+    val out2: ref u8 = lldb.clean_output(lldb.breakpoint_symbol(s, name))
     stdio.print("{s}\n", {out2})
 }
 

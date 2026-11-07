@@ -66,7 +66,8 @@ fn find_compiler(explicit: ref u8) ref u8 = trust {
 
 fn build_source(compiler: ref u8, source: ref u8) result[ref u8, ref u8] = trust {
     val base: ref u8 = strip_sx_ext(util.basename(source))
-    val out: ref u8 = @fmtalloc("/tmp/phantom-{d}-{s}", {native_pid(), base})
+    val tmp: ref u8 = fs.temp_dir_raw()
+    val out: ref u8 = @fmtalloc("{s}/phantom-{d}-{s}", {tmp, native_pid(), base})
     val cmd: ref u8 = @fmtalloc(
         "{s} {s} -alt -no-single-flags -o {s} 2>&1",
         {compiler, source, out}
@@ -94,11 +95,18 @@ when posix {
     extern (C, header) fn getpid() i32 = "getpid"
 }
 
+when windows {
+    extern (C, header) fn GetCurrentProcessId() u32 = "GetCurrentProcessId"
+}
+
 fn pid_via_os() i32 = trust {
     when windows {
-        return 0
+        return GetCurrentProcessId() as i32
     }
-    return getpid()
+    when posix {
+        return getpid()
+    }
+    return 0
 }
 
 fn load_target(arena: allocators.Arena, program: ref u8) result[ref target.Target, ref u8] = trust {
@@ -682,8 +690,12 @@ pub fn main() i32 = trust {
         val t: mut ref target.Target = none
         match t_opt {
             err e => {
-                stdio.print("phantom: {s}\n", {e})
-                return 1
+                if string.str_eql(backend, "native") || string.str_eql(backend, "dwarf") ||
+                string.str_eql(backend, "ptrace") {
+                    stdio.print("phantom: {s}\n", {e})
+                    return 1
+                }
+                t = target.empty(arena, program)
             }
             ok tv => {
                 t = tv

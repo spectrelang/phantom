@@ -6,6 +6,7 @@
 val stdio      = use("std/stdio")
 val string     = use("std/string")
 val os         = use("std/os")
+val fs         = use("std/fs")
 val allocators = use("std/allocators")
 val json       = use("std/json")
 val util       = use("util.sx")
@@ -19,6 +20,20 @@ extern (C, header) fn fflush(stream: ref void) i32 = "fflush"
 
 when posix {
     extern (C, header) fn getpid() i32 = "getpid"
+}
+
+when windows {
+    extern (C, header) fn GetCurrentProcessId() u32 = "GetCurrentProcessId"
+}
+
+fn dap_pid() i32 = trust {
+    when windows {
+        return GetCurrentProcessId() as i32
+    }
+    when posix {
+        return getpid()
+    }
+    return 0
 }
 
 type DapState = {
@@ -229,7 +244,9 @@ fn build_source(compiler: ref u8, source: ref u8) result[ref u8, ref u8] = trust
     if string.raw_ends_with(base, ".sx") {
         base = util.copy_cstr_len(base, string.len_raw(base) - 3)
     }
-    val out: ref u8 = @fmtalloc("/tmp/phantom-dap-{d}-{s}", {getpid(), base})
+    val out: ref u8 = @fmtalloc("{s}/phantom-dap-{d}-{s}", {
+        fs.temp_dir_raw(), dap_pid(), base
+    })
     val cmd: ref u8 = @fmtalloc(
         "{s} {s} -alt -no-single-flags -o {s} 2>&1",
         {compiler, source, out}
@@ -452,8 +469,12 @@ fn handle_launch(s: mut ref DapState, req_seq: i64, args: ref void) void = trust
     val meta_opt = load_metadata(arena, program)
     match meta_opt {
         err e => {
-            send_error(s, req_seq, "launch", e)
-            return
+            if string.str_eql(s.backend, "lldb") {
+                s.metadata = target.empty(arena, program)
+            } else {
+                send_error(s, req_seq, "launch", e)
+                return
+            }
         }
         ok mv => {
             s.metadata = mv
@@ -550,9 +571,11 @@ fn handle_set_function_breakpoints(s: mut ref DapState, req_seq: i64, args: ref 
                     val name_opt = json.obj_get_str(ev as ref void, "name")
                     if name_opt is some name {
                         val raw: ref u8 = target.function_raw(s.metadata, name as ref u8)
-                        if string.len_raw(raw) > 0 {
-                            lldb.breakpoint_symbol(s.lldb_session, raw)
+                        val bname: mut ref u8 = raw
+                        if string.len_raw(bname) == 0 {
+                            bname = name as ref u8
                         }
+                        lldb.breakpoint_symbol(s.lldb_session, bname)
                     }
                 }
                 ai++
