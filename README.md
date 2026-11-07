@@ -2,6 +2,54 @@
 
 Phantom is a <a href="https://spectrelang.org">Spectre</a> debugger with a native (DWARF, Linux x86_64) and LLDB backend.
 
+## Quick start
+
+Given `hi.sx`:
+
+```sx
+val stdio = use("std/stdio")
+
+pub fn main() void = {
+    val xs: [_]ref u8 = [
+        "hello", "world", "this", "is", "a", "test"
+    ]
+    for x in xs {
+        trust stdio.print("{s}\n", {x})
+    }
+}
+```
+
+Start an interactive session (Phantom compiles `.sx` inputs with the ALT
+backend automatically):
+
+```sh
+phantom debug hi.sx
+```
+
+Then, at the `(phantom)` prompt:
+
+```text
+break main
+run
+next
+locals
+continue
+```
+
+The same session can be run non-interactively with `-batch`:
+
+```sh
+phantom debug hi.sx -batch \
+    -ex 'break main' \
+    -ex run \
+    -ex next \
+    -ex locals \
+    -ex continue
+```
+
+Commands can also be read from a file with `-x commands.txt`, or from stdin.
+Batch mode prints only command output, without the banner or prompts.
+
 ## Run
 
 ```sh
@@ -109,3 +157,13 @@ The native backend currently supports:
 
 Not yet implemented natively: source-level stepping and full CFI-based
 unwinding. Use the LLDB backend if those are really needed.
+
+## Tests
+
+Unit tests live next to the code they cover:
+
+```sh
+spectre src/demangle.sx -alt -test
+spectre src/lldb.sx -alt -test
+spectre src/main.sx -alt -test
+```
