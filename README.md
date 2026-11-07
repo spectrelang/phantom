@@ -39,7 +39,7 @@ continue
 The second stop is inside the loop, so `locals` can show the array contents:
 
 ```text
-(int64_t / [_]ref u8) xs = ["hello", "world", "this", "is", "a", "test"]
+([_]ref u8) xs = ["hello", "world", "this", "is", "a", "test"]
 ```
 
 The same session can be run non-interactively with `-batch`:
