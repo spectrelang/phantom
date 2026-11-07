@@ -652,10 +652,357 @@ pub fn rewrite_expression(s: mut ref LldbSession, expr: ref u8) ref u8 = trust {
     return out
 }
 
+fn trim_copy(s: ref u8) ref u8 = trust {
+    if s == none {
+        return ""
+    }
+    val n: i64 = string.len_raw(s)
+    val start: mut i64 = 0
+    for {
+        if start >= n {
+            break
+        }
+        val c: u8 = @load8(@ptradd(s, start))
+        if c == 32 || c == 9 {
+            start++
+        } else {
+            break
+        }
+    }
+    val end: mut i64 = n
+    for {
+        if end <= start {
+            break
+        }
+        val c: u8 = @load8(@ptradd(s, end - 1))
+        if c == 32 || c == 9 {
+            end--
+        } else {
+            break
+        }
+    }
+    return util.copy_cstr_len(@ptradd(s, start), end - start)
+}
+
+fn map_c_base(s: ref u8) ref u8 = trust {
+    if string.str_eql(s, "int") || string.str_eql(s, "signed int") {
+        return "i32"
+    }
+    if string.str_eql(s, "unsigned int") || string.str_eql(s, "unsigned") {
+        return "u32"
+    }
+    if string.str_eql(s, "short") || string.str_eql(s, "short int") {
+        return "i16"
+    }
+    if string.str_eql(s, "unsigned short") || string.str_eql(s, "unsigned short int") {
+        return "u16"
+    }
+    if string.str_eql(s, "long") || string.str_eql(s, "long int") ||
+    string.str_eql(s, "long long") || string.str_eql(s, "long long int") {
+        return "i64"
+    }
+    if string.str_eql(s, "unsigned long") || string.str_eql(s, "unsigned long int") ||
+    string.str_eql(s, "unsigned long long") || string.str_eql(s, "unsigned long long int") {
+        return "u64"
+    }
+    if string.str_eql(s, "int64_t") {
+        return "i64"
+    }
+    if string.str_eql(s, "uint64_t") {
+        return "u64"
+    }
+    if string.str_eql(s, "int32_t") {
+        return "i32"
+    }
+    if string.str_eql(s, "uint32_t") {
+        return "u32"
+    }
+    if string.str_eql(s, "int16_t") {
+        return "i16"
+    }
+    if string.str_eql(s, "uint16_t") {
+        return "u16"
+    }
+    if string.str_eql(s, "int8_t") || string.str_eql(s, "signed char") {
+        return "i8"
+    }
+    if string.str_eql(s, "uint8_t") || string.str_eql(s, "unsigned char") ||
+    string.str_eql(s, "char") {
+        return "u8"
+    }
+    if string.str_eql(s, "size_t") || string.str_eql(s, "uintptr_t") {
+        return "usize"
+    }
+    if string.str_eql(s, "ssize_t") || string.str_eql(s, "intptr_t") {
+        return "isize"
+    }
+    if string.str_eql(s, "bool") || string.str_eql(s, "_Bool") {
+        return "bool"
+    }
+    if string.str_eql(s, "float") {
+        return "f32"
+    }
+    if string.str_eql(s, "double") {
+        return "f64"
+    }
+    if string.str_eql(s, "void") {
+        return "void"
+    }
+    return ""
+}
+
+/// Translate a C type name reported by LLDB into its Spectre spelling.
+pub fn spectre_type(c_type: ref u8) ref u8 = trust {
+    val t: ref u8 = trim_copy(c_type)
+    if string.len_raw(t) == 0 {
+        return ""
+    }
+    val depth: mut i64 = 0
+    val end: mut i64 = string.len_raw(t)
+    for {
+        for {
+            if end <= 0 {
+                break
+            }
+            val c: u8 = @load8(@ptradd(t, end - 1))
+            if c == 32 || c == 9 {
+                end--
+            } else {
+                break
+            }
+        }
+        if end <= 0 {
+            break
+        }
+        if @load8(@ptradd(t, end - 1)) == 42 {
+            depth++
+            end--
+        } else {
+            break
+        }
+    }
+    val base: ref u8 = trim_copy(util.copy_cstr_len(t, end))
+    val mapped: ref u8 = map_c_base(base)
+    if string.len_raw(mapped) == 0 {
+        return ""
+    }
+    val out: mut ref u8 = mapped
+    val i: mut i64 = 0
+    for {
+        if i >= depth {
+            break
+        }
+        out = @fmtalloc("ref {s}", {out})
+        i++
+    }
+    return out
+}
+
+/// Translate a Spectre type name into a C type usable in an LLDB expression.
+pub fn spectre_to_c_type(t: ref u8) ref u8 = trust {
+    val s: ref u8 = trim_copy(t)
+    if string.raw_starts_with(s, "ref ") {
+        val inner: ref u8 = trim_copy(@ptradd(s, 4))
+        if string.str_eql(inner, "u8") {
+            return "char *"
+        }
+        if string.str_eql(inner, "ref u8") {
+            return "char * *"
+        }
+        val inner_c: ref u8 = spectre_to_c_type(inner)
+        if string.len_raw(inner_c) == 0 {
+            return ""
+        }
+        return @fmtalloc("{s} *", {inner_c})
+    }
+    if string.str_eql(s, "i8") {
+        return "signed char"
+    }
+    if string.str_eql(s, "u8") {
+        return "unsigned char"
+    }
+    if string.str_eql(s, "i16") {
+        return "short"
+    }
+    if string.str_eql(s, "u16") {
+        return "unsigned short"
+    }
+    if string.str_eql(s, "i32") {
+        return "int"
+    }
+    if string.str_eql(s, "u32") {
+        return "unsigned int"
+    }
+    if string.str_eql(s, "i64") {
+        return "long"
+    }
+    if string.str_eql(s, "u64") {
+        return "unsigned long"
+    }
+    if string.str_eql(s, "usize") {
+        return "size_t"
+    }
+    if string.str_eql(s, "isize") {
+        return "long"
+    }
+    if string.str_eql(s, "bool") {
+        return "_Bool"
+    }
+    if string.str_eql(s, "f32") {
+        return "float"
+    }
+    if string.str_eql(s, "f64") {
+        return "double"
+    }
+    if string.str_eql(s, "void") {
+        return "void"
+    }
+    return ""
+}
+
+fn expression_line_value(out: ref u8) ref u8 = trust {
+    val n: i64 = string.len_raw(out)
+    val end: mut i64 = n
+    for {
+        if end <= 0 {
+            break
+        }
+        val c: u8 = @load8(@ptradd(out, end - 1))
+        if c == 10 || c == 13 || c == 32 || c == 9 {
+            end--
+        } else {
+            break
+        }
+    }
+    val start: mut i64 = end
+    for {
+        if start <= 0 {
+            break
+        }
+        val c: u8 = @load8(@ptradd(out, start - 1))
+        if c == 10 || c == 13 {
+            break
+        }
+        start--
+    }
+    val line: ref u8 = util.copy_cstr_len(@ptradd(out, start), end - start)
+    val rp: i64 = find_char(line, 0, 41)
+    val search: mut i64 = 0
+    if rp >= 0 {
+        search = rp + 1
+    }
+    val eq: i64 = find_char(line, search, 61)
+    if eq < 0 {
+        return line
+    }
+    val vs: mut i64 = eq + 1
+    val ln: i64 = string.len_raw(line)
+    for {
+        if vs >= ln {
+            break
+        }
+        val c: u8 = @load8(@ptradd(line, vs))
+        if c == 32 || c == 9 {
+            vs++
+        } else {
+            break
+        }
+    }
+    val value: ref u8 = util.copy_cstr_len(@ptradd(line, vs), ln - vs)
+    val q1: i64 = find_char(value, 0, 34)
+    if q1 >= 0 {
+        val vn: i64 = string.len_raw(value)
+        val q2: mut i64 = vn - 1
+        for {
+            if q2 <= q1 {
+                break
+            }
+            if @load8(@ptradd(value, q2)) == 34 {
+                return util.copy_cstr_len(@ptradd(value, q1), q2 - q1 + 1)
+            }
+            q2--
+        }
+    }
+    return value
+}
+
+/// Read up to 16 elements of an array-like variable through LLDB expressions.
+pub fn read_array(
+    s: mut ref LldbSession,
+    raw_name: ref u8,
+    elem_c_type: ref u8,
+    count: i64
+) ref u8 = trust {
+    if s == none || !s.alive || count <= 0 ||
+    string.len_raw(raw_name) == 0 || string.len_raw(elem_c_type) == 0 {
+        return ""
+    }
+    val sb: ref void = string.StringBuilder.new()
+    string.StringBuilder.append_cstr(sb, "[")
+    val limit: mut i64 = count
+    if limit > 16 {
+        limit = 16
+    }
+    val i: mut i64 = 0
+    for {
+        if i >= limit {
+            break
+        }
+        if i > 0 {
+            string.StringBuilder.append_cstr(sb, ", ")
+        }
+        val expr: ref u8 = @fmtalloc("(({s}*)({s}))[{lld}]", {
+            elem_c_type, raw_name, i
+        })
+        val out: ref u8 = clean_output(expression(s, expr))
+        if util.contains(out, "error:") {
+            string.StringBuilder.free(sb)
+            return ""
+        }
+        val drawn: ref u8 = expression_line_value(out)
+        if string.len_raw(drawn) == 0 {
+            string.StringBuilder.free(sb)
+            return ""
+        }
+        string.StringBuilder.append_cstr(sb, drawn)
+        i++
+    }
+    if count > limit {
+        string.StringBuilder.append_cstr(sb, ", ...")
+    }
+    string.StringBuilder.append_cstr(sb, "]")
+    val built: string.String = string.StringBuilder.build(sb)
+    val res: ref u8 = util.copy_cstr(string.cstr(built))
+    string.StringBuilder.free(sb)
+    return res
+}
+
 test "hex encoding roundtrips lldb command text" {
     trust {
         assert string.str_eql(hex_encode("abc"), "616263")
         assert string.str_eql(hex_encode(""), "")
         assert string.str_eql(hex_encode("a b'c"), "6120622763")
+    }
+}
+
+test "maps C types to Spectre types" {
+    trust {
+        assert string.str_eql(spectre_type("int"), "i32")
+        assert string.str_eql(spectre_type("int64_t"), "i64")
+        assert string.str_eql(spectre_type("unsigned long"), "u64")
+        assert string.str_eql(spectre_type("char *"), "ref u8")
+        assert string.str_eql(spectre_type("char **"), "ref ref u8")
+        assert string.str_eql(spectre_type("float"), "f32")
+        assert string.str_eql(spectre_type("double"), "f64")
+    }
+}
+
+test "maps Spectre types back to C types" {
+    trust {
+        assert string.str_eql(spectre_to_c_type("i64"), "long")
+        assert string.str_eql(spectre_to_c_type("u8"), "unsigned char")
+        assert string.str_eql(spectre_to_c_type("ref u8"), "char *")
+        assert string.str_eql(spectre_to_c_type("ref ref u8"), "char * *")
+        assert string.str_eql(spectre_to_c_type("ref i32"), "int *")
     }
 }

@@ -29,20 +29,26 @@ phantom debug hi.sx
 Then, at the `(phantom)` prompt:
 
 ```text
-break main
+break hi.sx:8
 run
-next
+continue
 locals
 continue
+```
+
+The second stop is inside the loop, so `locals` can show the array contents:
+
+```text
+(int64_t / [_]ref u8) xs = ["hello", "world", "this", "is", "a", "test"]
 ```
 
 The same session can be run non-interactively with `-batch`:
 
 ```sh
 phantom debug hi.sx -batch \
-    -ex 'break main' \
+    -ex 'break hi.sx:8' \
     -ex run \
-    -ex next \
+    -ex continue \
     -ex locals \
     -ex continue
 ```
@@ -165,5 +171,6 @@ Unit tests live next to the code they cover:
 ```sh
 spectre src/demangle.sx -alt -test
 spectre src/lldb.sx -alt -test
+spectre src/cli.sx -alt -test
 spectre src/main.sx -alt -test
 ```

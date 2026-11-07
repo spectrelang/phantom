@@ -9,6 +9,7 @@ val fs         = use("std/fs")
 val allocators = use("std/allocators")
 val util       = use("util.sx")
 val target     = use("target.sx")
+val dwarf      = use("dwarf.sx")
 val lldb       = use("lldb.sx")
 val native     = use("native.sx")
 
@@ -81,14 +82,330 @@ fn print_help() void = trust {
     stdio.puts("  quit, q                quit")
 }
 
-fn print_locals_lldb(s: mut ref lldb.LldbSession) void = trust {
+type SourceVarInfo = {
+    type_text: mut ref u8
+    array_count: mut i64
+}
+
+fn source_trim(s: ref u8) ref u8 = trust {
+    if s == none {
+        return ""
+    }
+    val n: i64 = string.len_raw(s)
+    val start: mut i64 = 0
+    for {
+        if start >= n {
+            break
+        }
+        val c: u8 = @load8(@ptradd(s, start))
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            start++
+        } else {
+            break
+        }
+    }
+    val end: mut i64 = n
+    for {
+        if end <= start {
+            break
+        }
+        val c: u8 = @load8(@ptradd(s, end - 1))
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            end--
+        } else {
+            break
+        }
+    }
+    return util.copy_cstr_len(@ptradd(s, start), end - start)
+}
+
+fn source_is_ident(c: u8) bool = trust {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) ||
+    (c >= 48 && c <= 57) || c == 95
+}
+
+fn source_match_at(s: ref u8, pos: i64, needle: ref u8) bool = trust {
+    val n: i64 = string.len_raw(s)
+    val m: i64 = string.len_raw(needle)
+    if pos < 0 || pos + m > n {
+        return false
+    }
+    val i: mut i64 = 0
+    for {
+        if i >= m {
+            break
+        }
+        if @load8(@ptradd(s, pos + i)) != @load8(@ptradd(needle, i)) {
+            return false
+        }
+        i++
+    }
+    return true
+}
+
+fn source_skip_ws(s: ref u8, pos_in: i64) i64 = trust {
+    val n: i64 = string.len_raw(s)
+    val p: mut i64 = pos_in
+    for {
+        if p >= n {
+            break
+        }
+        val c: u8 = @load8(@ptradd(s, p))
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            p++
+        } else {
+            break
+        }
+    }
+    return p
+}
+
+fn source_count_elements(s: ref u8, start: i64) i64 = trust {
+    val n: i64 = string.len_raw(s)
+    val depth: mut i64 = 1
+    val count: mut i64 = 0
+    val has_item: mut bool = false
+    val i: mut i64 = start
+    for {
+        if i >= n {
+            break
+        }
+        val c: u8 = @load8(@ptradd(s, i))
+        if c == 34 || c == 39 {
+            has_item = true
+            val quote: u8 = c
+            i++
+            for {
+                if i >= n {
+                    break
+                }
+                val d: u8 = @load8(@ptradd(s, i))
+                if d == 92 {
+                    i += 2
+                    continue
+                }
+                i++
+                if d == quote {
+                    break
+                }
+            }
+            continue
+        }
+        if c == 35 {
+            for {
+                if i >= n || @load8(@ptradd(s, i)) == 10 {
+                    break
+                }
+                i++
+            }
+            continue
+        }
+        if c == 91 {
+            depth++
+            has_item = true
+            i++
+            continue
+        }
+        if c == 93 {
+            depth--
+            if depth == 0 {
+                break
+            }
+            has_item = true
+            i++
+            continue
+        }
+        if c == 44 && depth == 1 {
+            if has_item {
+                count++
+                has_item = false
+            }
+            i++
+            continue
+        }
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            i++
+            continue
+        }
+        has_item = true
+        i++
+    }
+    if has_item {
+        count++
+    }
+    if depth != 0 {
+        return -1
+    }
+    return count
+}
+
+fn source_var_info(file: ref u8, name: ref u8) SourceVarInfo = trust {
+    val info: mut SourceVarInfo = {type_text: "", array_count: -1}
+    if file == none || name == none ||
+    string.len_raw(file) == 0 || string.len_raw(name) == 0 {
+        return info
+    }
+    val data_opt = fs.read_all_raw(file)
+    val data: mut ref u8 = none
+    if data_opt is some dv {
+        data = dv as ref u8
+    } else {
+        return info
+    }
+    val n: i64 = string.len_raw(data)
+    val name_len: i64 = string.len_raw(name)
+    val i: mut i64 = 0
+    for {
+        if i + name_len > n {
+            break
+        }
+        if source_match_at(data, i, name) {
+            val before_ok: bool = i == 0 || !source_is_ident(@load8(@ptradd(data, i - 1)))
+            val after_i: i64 = i + name_len
+            val after_ok: bool = after_i >= n || !source_is_ident(@load8(@ptradd(data, after_i)))
+            if before_ok && after_ok {
+                val p0: i64 = source_skip_ws(data, after_i)
+                val p: mut i64 = p0
+                val type_text: mut ref u8 = ""
+                if p < n && @load8(@ptradd(data, p)) == 58 {
+                    val ts: i64 = source_skip_ws(data, p + 1)
+                    val te: mut i64 = ts
+                    for {
+                        if te >= n {
+                            break
+                        }
+                        val c: u8 = @load8(@ptradd(data, te))
+                        if c == 61 || c == 10 || c == 13 {
+                            break
+                        }
+                        te++
+                    }
+                    type_text = source_trim(util.copy_cstr_len(@ptradd(data, ts), te - ts))
+                    p = source_skip_ws(data, te)
+                }
+                if p < n && @load8(@ptradd(data, p)) == 61 {
+                    info.type_text = type_text
+                    val rhs: i64 = source_skip_ws(data, p + 1)
+                    if rhs < n && @load8(@ptradd(data, rhs)) == 91 {
+                        info.array_count = source_count_elements(data, rhs + 1)
+                    }
+                    return info
+                }
+            }
+        }
+        i++
+    }
+    return info
+}
+
+fn find_dwarf_var(t: ref target.Target, raw_name: ref u8) ref dwarf.DwarfVariable = trust {
+    for v in t.dwarf_info.variables {
+        if string.str_eql(v.name, raw_name) {
+            return v
+        }
+    }
+    return none
+}
+
+fn array_element_type(type_text: ref u8) ref u8 = trust {
+    if string.len_raw(type_text) == 0 || @load8(type_text) != 91 {
+        return ""
+    }
+    val rb: i64 = find_char(type_text, 0, 93)
+    if rb < 0 {
+        return ""
+    }
+    return source_trim(@ptradd(type_text, rb + 1))
+}
+
+fn value_u64(value: ref u8) option[u64] = trust {
+    val v: ref u8 = source_trim(value)
+    if string.len_raw(v) == 0 {
+        return none
+    }
+    if string.raw_starts_with(v, "0x") || string.raw_starts_with(v, "0X") {
+        return util.parse_u64_hex(v)
+    }
+    val iv_opt = util.parse_i64(v)
+    if iv_opt is some iv {
+        if iv < 0 {
+            return none
+        }
+        return some (iv as u64)
+    }
+    return none
+}
+
+fn value_in_exec_section(t: ref target.Target, value: u64) bool = trust {
+    // PIE targets report runtime addresses, so the link-time section ranges do
+    // not apply directly.
+    if t.elf_file.etype == 3 {
+        return false
+    }
+    for sec in t.elf_file.sections {
+        if (sec.flags & 4) == 0 || sec.size == 0 {
+            continue
+        }
+        if value >= sec.addr && value < sec.addr + sec.size {
+            return true
+        }
+    }
+    return false
+}
+
+fn value_is_readable_pointer(t: ref target.Target, value: ref u8) bool = trust {
+    val ptr_opt = value_u64(value)
+    if ptr_opt is some ptr {
+        if ptr < 4096 {
+            return false
+        }
+        return !value_in_exec_section(t, ptr)
+    }
+    return false
+}
+
+fn print_locals_lldb(s: mut ref lldb.LldbSession, t: ref target.Target) void = trust {
     val vars: list[ref lldb.LldbVar] = lldb.parse_variables(lldb.clean_output(lldb.frame_variables(s)))
     if @len(vars) == 0 {
         stdio.puts("  (no locals)")
         return
     }
     for v in vars {
-        stdio.print("  ({s}) {s} = {s}\n", {v.type_name, v.name, v.value})
+        val spectre: mut ref u8 = ""
+        val array_count: mut i64 = -1
+        val dv: ref dwarf.DwarfVariable = find_dwarf_var(t, v.raw_name)
+        if dv != none {
+            val info: SourceVarInfo = source_var_info(dv.file, v.name)
+            if string.len_raw(info.type_text) > 0 {
+                spectre = info.type_text
+            }
+            array_count = info.array_count
+        }
+        if string.len_raw(spectre) == 0 {
+            spectre = lldb.spectre_type(v.type_name)
+        }
+        val value: mut ref u8 = v.value
+        if array_count >= 0 && value_is_readable_pointer(t, v.value) {
+            val elem_type: ref u8 = array_element_type(spectre)
+            if string.len_raw(elem_type) > 0 {
+                val elem_c: ref u8 = lldb.spectre_to_c_type(elem_type)
+                if string.len_raw(elem_c) > 0 {
+                    val array_value: ref u8 = lldb.read_array(
+                        s, v.raw_name, elem_c, array_count
+                    )
+                    if string.len_raw(array_value) > 0 {
+                        value = array_value
+                    }
+                }
+            }
+        }
+        if string.len_raw(spectre) > 0 {
+            stdio.print("  ({s} / {s}) {s} = {s}\n", {
+                v.type_name, spectre, v.name, value
+            })
+        } else {
+            stdio.print("  ({s}) {s} = {s}\n", {v.type_name, v.name, value})
+        }
     }
 }
 
@@ -348,7 +665,7 @@ fn exec_lldb_command(
             stdio.puts("usage: delete <id>")
         }
     } elif string.str_eql(cmd, "locals") || string.str_eql(cmd, "vars") || string.str_eql(cmd, "l") {
-        print_locals_lldb(s)
+        print_locals_lldb(s, t)
     } elif string.str_eql(cmd, "print") || string.str_eql(cmd, "p") {
         val expr: ref u8 = lldb.rewrite_expression(s, rest)
         val out: ref u8 = lldb.clean_output(lldb.expression(s, expr))
@@ -674,4 +991,34 @@ pub fn run(
         return run_native(program, args, batch, commands)
     }
     return run_lldb(t, program, args, batch, commands)
+}
+
+test "counts fixed array literal elements" {
+    trust {
+        assert source_count_elements("[\"a\", \"b\", [1, 2], \"c\"]", 1) == 4
+        assert source_count_elements("[1, 2, 3]", 1) == 3
+        assert source_count_elements("[]", 1) == 0
+    }
+}
+
+test "extracts array element types" {
+    trust {
+        assert string.str_eql(array_element_type("[_]ref u8"), "ref u8")
+        assert string.str_eql(array_element_type("i64"), "")
+    }
+}
+
+test "reads source variable types and array lengths" {
+    trust {
+        val dir: ref u8 = fs.temp_dir_raw()
+        val path: ref u8 = @fmtalloc("{s}/phantom-source-test.sx", {dir})
+        assert fs.write_all(
+            path,
+            "val xs: [_]ref u8 = [\n    \"a\", \"b\", [1, 2], \"c\"\n]\n"
+        )
+        val info: SourceVarInfo = source_var_info(path, "xs")
+        assert string.str_eql(info.type_text, "[_]ref u8")
+        assert info.array_count == 4
+        fs.delete(path)
+    }
 }
