@@ -41,10 +41,30 @@ pub type LldbSession = {
 }
 
 val MARKER: ref u8 = "@@PHANTOM_LLDB_END_a91c@@"
-val MARKER_CMD: ref u8 = "script print(\"\".join(map(chr,[64,64,80,72,65,78,84,79,77,95,76,76,68,66,95,69,78,68,95,97,57,49,99,64,64])))"
 
 fn argv_new() list[ref u8] = trust {
     return @listalloc[allocators.HeapAllocator, ref u8](util.heap())?
+}
+
+fn hex_encode(s: ref u8) ref u8 = trust {
+    val n: i64 = string.len_raw(s)
+    val out: ref u8 = @alloc((n * 2 + 1) as usize) as ref u8
+    if out == none {
+        return ""
+    }
+    val digits: ref u8 = "0123456789abcdef"
+    val i: mut i64 = 0
+    for {
+        if i >= n {
+            break
+        }
+        val c: u8 = @load8(@ptradd(s, i))
+        @store8(@ptradd(out, i * 2), @load8(@ptradd(digits, (c >> 4) as i64)))
+        @store8(@ptradd(out, i * 2 + 1), @load8(@ptradd(digits, (c & 15) as i64)))
+        i++
+    }
+    @store8(@ptradd(out, n * 2), 0)
+    return out
 }
 
 /// Start an LLDB process and select `program` as its target.
@@ -94,19 +114,30 @@ pub fn new(lldb_path: ref u8, program: ref u8) result[ref LldbSession, ref u8] =
 }
 
 /// Send one command to lldb and return all output produced before it stopped.
+///
+/// Commands are executed through lldb's Python API so that the completion
+/// marker can be printed *after* the command has finished. In particular,
+/// `process launch` and `process continue` return immediately in asynchronous
+/// mode; commands written while the inferior is running are not executed, so a
+/// plain marker command on the next input line would be lost and we would
+/// block forever waiting for it. The wrapper also waits for the process to
+/// stop or exit before printing the marker.
 pub fn command(s: mut ref LldbSession, cmd: ref u8) ref u8 = trust {
     if s == none || !s.alive {
         return ""
     }
-    if !proc.write_all(s.child.in_fd, cmd, string.len_raw(cmd)) {
+    if string.str_eql(cmd, "quit") {
+        proc.write_all(s.child.in_fd, "quit\n", 5)
         s.alive = false
         return ""
     }
-    if !proc.write_all(s.child.in_fd, "\n", 1) {
-        s.alive = false
-        return ""
-    }
-    if !proc.write_all(s.child.in_fd, MARKER_CMD, string.len_raw(MARKER_CMD)) {
+    val cmd_hex: ref u8 = hex_encode(cmd)
+    val marker_hex: ref u8 = hex_encode(MARKER)
+    val wrapped: ref u8 = @fmtalloc(
+        "script import lldb,time; d=lldb.debugger; t=d.GetSelectedTarget(); d.HandleCommand(bytes.fromhex('{s}').decode('utf-8','surrogateescape')); p=t.GetProcess(); exec(\"while p.IsValid() and p.GetState() in (lldb.eStateLaunching,lldb.eStateAttaching,lldb.eStateConnected,lldb.eStateRunning,lldb.eStateStepping):\\n    time.sleep(0.01)\"); print(bytes.fromhex('{s}').decode('utf-8'))",
+        {cmd_hex, marker_hex}
+    )
+    if !proc.write_all(s.child.in_fd, wrapped, string.len_raw(wrapped)) {
         s.alive = false
         return ""
     }
@@ -197,8 +228,8 @@ pub fn clean_output(out: ref u8) ref u8 = trust {
         }
         val line: ref u8 = util.copy_cstr_len(@ptradd(out, pos), end - pos)
         val skip: bool = string.str_eql(line, MARKER) ||
-        string.raw_starts_with(line, "script print(\"\".join") ||
-        string.raw_starts_with(line, "(lldb) script print")
+        string.raw_starts_with(line, "script import lldb,time") ||
+        string.raw_starts_with(line, "(lldb) script import lldb,time")
         if !skip {
             if string.raw_starts_with(line, "(lldb) ") {
                 string.StringBuilder.append_cstr(sb, @ptradd(line, 7))

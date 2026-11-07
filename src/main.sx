@@ -104,6 +104,107 @@ fn load_target(arena: allocators.Arena, program: ref u8) result[ref target.Targe
     return target.load(arena, program)
 }
 
+type SymbolRow = {
+    display: mut ref u8
+    raw: mut ref u8
+    address: mut ref u8
+}
+
+type VariableRow = {
+    function: mut ref u8
+    symbol: mut ref u8
+    name: mut ref u8
+    type_name: mut ref u8
+    location: mut ref u8
+}
+
+fn table_max(width: i64, s: ref u8) i64 = trust {
+    val n: i64 = string.len_raw(s)
+    if n > width {
+        return n
+    }
+    return width
+}
+
+fn table_field(s: ref u8, width: i64) void = trust {
+    stdio.print("{s}", {s})
+    val i: mut i64 = string.len_raw(s)
+    for {
+        if i >= width {
+            break
+        }
+        stdio.print(" ", {})
+        i++
+    }
+    stdio.print("  ", {})
+}
+
+fn table_last(s: ref u8) void = trust {
+    stdio.print("{s}\n", {s})
+}
+
+fn symbol_row_add(
+    rows: mut list[ref SymbolRow],
+    display: ref u8,
+    raw: ref u8,
+    address: ref u8
+) void = trust {
+    val r: mut ref SymbolRow = @alloc(@sizeof(SymbolRow)) as ref SymbolRow
+    r.display = display
+    r.raw = raw
+    r.address = address
+    @append(rows, r)
+}
+
+fn symbol_rows(t: ref target.Target, query: ref u8) list[ref SymbolRow] = trust {
+    val rows: mut list[ref SymbolRow] =
+    @listalloc[allocators.HeapAllocator, ref SymbolRow](util.heap())?
+    if string.len_raw(query) > 0 {
+        val fns: list[ref dwarf.DwarfFunction] = target.find_functions(t, query, 200)
+        for f in fns {
+            symbol_row_add(rows, f.display, f.name, @fmtalloc("[{x}..{x}]", {
+                f.low_pc, f.high_pc
+            }))
+        }
+        for sym in t.elf_file.symbols {
+            if elf.symbol_is_code(sym) && demangle.matches(sym.name, query) {
+                symbol_row_add(rows, demangle.pretty(sym.name), sym.name, @fmtalloc("[{x}]", {
+                    sym.value
+                }))
+            }
+        }
+        return rows
+    }
+    for f in t.dwarf_info.functions {
+        symbol_row_add(rows, f.display, f.name, @fmtalloc("[{x}..{x}]", {
+            f.low_pc, f.high_pc
+        }))
+    }
+    return rows
+}
+
+fn print_symbol_table(rows: list[ref SymbolRow]) void = trust {
+    if (@len(rows) as i64) == 0 {
+        return
+    }
+    val name_w: mut i64 = 4
+    val raw_w: mut i64 = 6
+    val addr_w: mut i64 = 7
+    for r in rows {
+        name_w = table_max(name_w, r.display)
+        raw_w = table_max(raw_w, r.raw)
+        addr_w = table_max(addr_w, r.address)
+    }
+    table_field("NAME", name_w)
+    table_field("SYMBOL", raw_w)
+    table_last("ADDRESS")
+    for r in rows {
+        table_field(r.display, name_w)
+        table_field(r.raw, raw_w)
+        table_last(r.address)
+    }
+}
+
 fn cmd_symbols(program: ref u8, query: ref u8) i32 = trust {
     val arena: allocators.Arena = allocators.Arena.new(64 * 1024 * 1024 as usize)?
     val t_opt = load_target(arena, program)
@@ -117,21 +218,8 @@ fn cmd_symbols(program: ref u8, query: ref u8) i32 = trust {
             t = tv
         }
     }
-    if string.len_raw(query) > 0 {
-        val fns: list[ref dwarf.DwarfFunction] = target.find_functions(t, query, 200)
-        for f in fns {
-            stdio.print("{s} -> {s} [{x}..{x}]\n", {f.display, f.name, f.low_pc, f.high_pc})
-        }
-        for sym in t.elf_file.symbols {
-            if elf.symbol_is_code(sym) && demangle.matches(sym.name, query) {
-                stdio.print("{s} -> {s} [{x}]\n", {demangle.pretty(sym.name), sym.name, sym.value})
-            }
-        }
-        return 0
-    }
-    for f in t.dwarf_info.functions {
-        stdio.print("{s} -> {s} [{x}..{x}]\n", {f.display, f.name, f.low_pc, f.high_pc})
-    }
+    val rows: list[ref SymbolRow] = symbol_rows(t, query)
+    print_symbol_table(rows)
     return 0
 }
 
@@ -179,6 +267,74 @@ fn cmd_lines(program: ref u8, query: ref u8) i32 = trust {
     return 0
 }
 
+fn variable_row_add(
+    rows: mut list[ref VariableRow],
+    function: ref u8,
+    symbol: ref u8,
+    name: ref u8,
+    type_name: ref u8,
+    location: ref u8
+) void = trust {
+    val r: mut ref VariableRow = @alloc(@sizeof(VariableRow)) as ref VariableRow
+    r.function = function
+    r.symbol = symbol
+    r.name = name
+    r.type_name = type_name
+    r.location = location
+    @append(rows, r)
+}
+
+fn variable_rows(t: ref target.Target, fn_query: ref u8) list[ref VariableRow] = trust {
+    val rows: mut list[ref VariableRow] =
+    @listalloc[allocators.HeapAllocator, ref VariableRow](util.heap())?
+    for f in t.dwarf_info.functions {
+        if string.len_raw(fn_query) > 0 && !demangle.matches(f.name, fn_query) {
+            continue
+        }
+        for v in f.variables {
+            variable_row_add(
+                rows,
+                f.display,
+                f.name,
+                v.source_name,
+                type_name_of(t.dwarf_info, v.type_off),
+                @fmtalloc("{s}:{lld}", {v.file, v.line})
+            )
+        }
+    }
+    return rows
+}
+
+fn print_variable_table(rows: list[ref VariableRow]) void = trust {
+    if (@len(rows) as i64) == 0 {
+        return
+    }
+    val fn_w: mut i64 = 8
+    val sym_w: mut i64 = 6
+    val name_w: mut i64 = 8
+    val type_w: mut i64 = 4
+    val loc_w: mut i64 = 8
+    for r in rows {
+        fn_w = table_max(fn_w, r.function)
+        sym_w = table_max(sym_w, r.symbol)
+        name_w = table_max(name_w, r.name)
+        type_w = table_max(type_w, r.type_name)
+        loc_w = table_max(loc_w, r.location)
+    }
+    table_field("FUNCTION", fn_w)
+    table_field("SYMBOL", sym_w)
+    table_field("VARIABLE", name_w)
+    table_field("TYPE", type_w)
+    table_last("LOCATION")
+    for r in rows {
+        table_field(r.function, fn_w)
+        table_field(r.symbol, sym_w)
+        table_field(r.name, name_w)
+        table_field(r.type_name, type_w)
+        table_last(r.location)
+    }
+}
+
 fn cmd_variables(program: ref u8, fn_query: ref u8) i32 = trust {
     val arena: allocators.Arena = allocators.Arena.new(64 * 1024 * 1024 as usize)?
     val t_opt = load_target(arena, program)
@@ -192,17 +348,8 @@ fn cmd_variables(program: ref u8, fn_query: ref u8) i32 = trust {
             t = tv
         }
     }
-    for f in t.dwarf_info.functions {
-        if string.len_raw(fn_query) > 0 && !demangle.matches(f.name, fn_query) {
-            continue
-        }
-        stdio.print("{s} ({s})\n", {f.display, f.name})
-        for v in f.variables {
-            stdio.print("  {s}: {s} (file {s}:{lld})\n", {
-                v.source_name, type_name_of(t.dwarf_info, v.type_off), v.file, v.line
-            })
-        }
-    }
+    val rows: list[ref VariableRow] = variable_rows(t, fn_query)
+    print_variable_table(rows)
     return 0
 }
 

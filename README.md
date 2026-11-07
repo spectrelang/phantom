@@ -30,9 +30,9 @@ list [line]                show source around the current line
 quit / q                   quit
 ```
 
-Breakpoints accept demangled names such as `main`, `parser::parse_expr`, or
-`make_list<i32>`, as well as `file.sx:42`. Variable expressions use Spectre
-source names (`sum`, `point.x`, `items[2]`); Phantom translates them back to
+Breakpoints accept demangled names such as `main`, `parser.parse_expr`, or
+`make_list[i32]`, as well as `file.sx:42`. Variable expressions use Spectre
+source names (`sum`, `point.x`); Phantom translates them back to
 the compiler's internal `t_` / `sx__` names where needed.
 
 ## Symbol inspection
@@ -46,8 +46,8 @@ phantom variables ./binary [function]
 Symbol names are shown demangled, e.g.:
 
 ```text
-std::stdio::print
-generic_id<i32>
+std.stdio.print
+generic_id[i32]
 ```
 
 ## DAP

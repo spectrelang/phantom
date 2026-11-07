@@ -114,6 +114,15 @@ pub fn demangle(sym: ref u8) Demangled = trust {
     if string.len_raw(sym) == 0 || @load8(sym) == 95 || @load8(sym) == 46 {
         return d
     }
+    // The compiler's runtime entry point is not user code; label it clearly
+    // instead of showing the internal `sx__init` spelling.
+    if string.str_eql(sym, "sx__init") {
+        d.module = ""
+        d.name = "init"
+        d.generic = ""
+        d.display = "[spectre runtime init]"
+        return d
+    }
 
     val s: mut ref u8 = sym
     if string.raw_starts_with(s, "sx__") {
@@ -193,7 +202,7 @@ pub fn demangle(sym: ref u8) Demangled = trust {
         d.name = @ptradd(base, last_sep + 2)
     }
 
-    // Convert remaining double underscores in the module prefix to "::" for
+    // Convert remaining double underscores in the module prefix to "." for
     // display purposes.
     if string.len_raw(d.module) > 0 {
         val slen: i64 = string.len_raw(d.module)
@@ -206,9 +215,8 @@ pub fn demangle(sym: ref u8) Demangled = trust {
             }
             if si + 1 < slen && @load8(@ptradd(d.module, si)) == 95 &&
             @load8(@ptradd(d.module, si + 1)) == 95 {
-                @store8(@ptradd(pretty_mod, oi), 58)
-                @store8(@ptradd(pretty_mod, oi + 1), 58)
-                oi += 2
+                @store8(@ptradd(pretty_mod, oi), 46)
+                oi++
                 si += 2
             } else {
                 @store8(@ptradd(pretty_mod, oi), @load8(@ptradd(d.module, si)))
@@ -223,13 +231,13 @@ pub fn demangle(sym: ref u8) Demangled = trust {
     d.generic = generic_args(gen)
     if string.len_raw(d.module) > 0 {
         if string.len_raw(d.generic) > 0 {
-            d.display = @fmtalloc("{s}::{s}<{s}>", {d.module, d.name, d.generic})
+            d.display = @fmtalloc("{s}.{s}[{s}]", {d.module, d.name, d.generic})
         } else {
-            d.display = @fmtalloc("{s}::{s}", {d.module, d.name})
+            d.display = @fmtalloc("{s}.{s}", {d.module, d.name})
         }
     } else {
         if string.len_raw(d.generic) > 0 {
-            d.display = @fmtalloc("{s}<{s}>", {d.name, d.generic})
+            d.display = @fmtalloc("{s}[{s}]", {d.name, d.generic})
         } else {
             d.display = d.name
         }
@@ -264,9 +272,11 @@ pub fn matches(sym: ref u8, query: ref u8) bool = trust {
     if string.str_eql(source_name(sym), query) {
         return true
     }
-    // Accept "module::name", "module.name", "module/name" spellings.
+    // Accept "module::name", "module.name", "module/name" spellings, and
+    // both <> and [] for generic arguments.
     val n: i64 = string.len_raw(query)
     val norm: ref u8 = @alloc((n + 1) as usize) as ref u8
+    val oi: mut i64 = 0
     val i: mut i64 = 0
     for {
         if i >= n {
@@ -274,21 +284,29 @@ pub fn matches(sym: ref u8, query: ref u8) bool = trust {
         }
         val c: u8 = @load8(@ptradd(query, i))
         if c == 46 || c == 47 || c == 58 {
-            @store8(@ptradd(norm, i), 58)
+            @store8(@ptradd(norm, oi), 46)
+            oi++
             if c == 58 && i + 1 < n && @load8(@ptradd(query, i + 1)) == 58 {
                 i++
             }
+        } elif c == 60 {
+            @store8(@ptradd(norm, oi), 91)
+            oi++
+        } elif c == 62 {
+            @store8(@ptradd(norm, oi), 93)
+            oi++
         } else {
-            @store8(@ptradd(norm, i), c)
+            @store8(@ptradd(norm, oi), c)
+            oi++
         }
         i++
     }
-    @store8(@ptradd(norm, i), 0)
+    @store8(@ptradd(norm, oi), 0)
     if string.str_eql(d.display, norm) {
         return true
     }
     // Match a trailing component: e.g. "stdio.print" against
-    // "std::stdio::print".
+    // "std.stdio.print".
     val suffix: mut ref u8 = query
     for {
         if string.len_raw(suffix) == 0 {
