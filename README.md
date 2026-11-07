@@ -38,9 +38,9 @@ the compiler's internal `t_` / `sx__` names where needed.
 ## Symbol inspection
 
 ```sh
-phantom-dev symbols ./binary [query]
-phantom-dev lines ./binary [file:line]
-phantom-dev variables ./binary [function]
+phantom symbols ./binary [query]
+phantom lines ./binary [file:line]
+phantom variables ./binary [function]
 ```
 
 Symbol names are shown demangled, e.g.:
@@ -53,8 +53,8 @@ generic_id<i32>
 ## DAP
 
 ```sh
-phantom-dev dap -backend native
-phantom-dev dap -backend lldb -program ./path/to/binary
+phantom dap -backend native
+phantom dap -backend lldb -program ./path/to/binary
 ```
 
 The server speaks DAP over stdin/stdout (`Content-Length` framing). A typical
@@ -74,7 +74,7 @@ Run the adapter command with the backend you want:
 
 ```json
 "debugServer": 0,
-"miDebuggerPath": "${workspaceFolder}/phantom-dev",
+"miDebuggerPath": "${workspaceFolder}/phantom",
 "miDebuggerArgs": ["dap", "-backend", "native"]
 ```
 
