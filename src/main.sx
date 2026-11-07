@@ -390,21 +390,21 @@ fn usage() void = trust {
     stdio.puts("phantom - spectre debugger")
     stdio.puts("")
     stdio.puts("subcommands:")
-    stdio.puts("  debug <file.sx|binary> [options] [-- program args...]")
-    stdio.puts("  dap [options]")
-    stdio.puts("  build <file.sx> [-o <output>]")
-    stdio.puts("  symbols <binary> [query]")
-    stdio.puts("  lines <binary> [file:line]")
+    stdio.puts("  debug     <file.sx|binary> [options] [-- program args...]")
+    stdio.puts("  dap       [options]")
+    stdio.puts("  build     <file.sx> [-o <output>]")
+    stdio.puts("  symbols   <binary> [query]")
+    stdio.puts("  lines     <binary> [file:line]")
     stdio.puts("  variables <binary> [function]")
     stdio.puts("")
     stdio.puts("options:")
-    stdio.puts("  -backend lldb|native   select backend (default: lldb)")
-    stdio.puts("  -compiler <path>       spectre compiler used for .sx inputs")
-    stdio.puts("  -batch, --batch        run commands non-interactively, then exit")
-    stdio.puts("  -ex, --eval-command <cmd>  execute one command (repeatable)")
-    stdio.puts("  -x, --command <file>   execute commands from a file (repeatable)")
-    stdio.puts("  -o <path>              output path for 'build'")
-    stdio.puts("  -program <path>        preset program for 'dap'")
+    stdio.puts("  -backend lldb|native     select backend (default: lldb)")
+    stdio.puts("  -compiler <path>         spectre compiler used for .sx inputs")
+    stdio.puts("  -batch                   run commands non-interactively, then exit")
+    stdio.puts("  -ex, -eval-command <cmd> execute one command (repeatable)")
+    stdio.puts("  -x, -command <file>      execute commands from a file (repeatable)")
+    stdio.puts("  -o <path>                output path for 'build'")
+    stdio.puts("  -program <path>          preset program for 'dap'")
 }
 
 /// Turn a source file into a debuggable binary when needed.
@@ -641,15 +641,15 @@ pub fn main() i32 = trust {
                 if string.len_raw(command) > 0 {
                     @append(batch_commands, command)
                 }
-            } elif string.str_eql(a, "-x") || string.str_eql(a, "--command") {
+            } elif string.str_eql(a, "-x") || string.str_eql(a, "-command") {
                 i++
                 val path: ref u8 = arg_at(args, i)
                 if !batch_add_file(batch_commands, path) {
                     stdio.print("phantom: cannot read command file '{s}'\n", {path})
                     return 1
                 }
-            } elif string.raw_starts_with(a, "--command=") {
-                val path: ref u8 = @ptradd(a, string.len_raw("--command="))
+            } elif string.raw_starts_with(a, "-command=") {
+                val path: ref u8 = @ptradd(a, string.len_raw("-command="))
                 if !batch_add_file(batch_commands, path) {
                     stdio.print("phantom: cannot read command file '{s}'\n", {path})
                     return 1
