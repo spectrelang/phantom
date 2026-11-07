@@ -1,0 +1,622 @@
+/// LLDB command wrapper used by Phantom's default backend.
+///
+/// (C) Navid Momtahen - 2026
+/// SPDX-License-Identifier: GPL-3.0-only
+
+val string     = use("std/string")
+val allocators = use("std/allocators")
+val proc       = use("proc.sx")
+val util       = use("util.sx")
+val demangle   = use("demangle.sx")
+
+when posix {
+    extern (C, header) fn usleep(usec: u32) i32 = "usleep"
+}
+
+pub type LldbFrame = {
+    index: mut i64
+    address: mut u64
+    function_raw: mut ref u8
+    function_display: mut ref u8
+    file: mut ref u8
+    line: mut i64
+    column: mut i64
+}
+
+pub type LldbVar = {
+    type_name: mut ref u8
+    raw_name: mut ref u8
+    name: mut ref u8
+    value: mut ref u8
+}
+
+pub type LldbSession = {
+    child: mut ref proc.Child
+    program: mut ref u8
+    alive: mut bool
+    stopped: mut bool
+    exited: mut bool
+    exit_code: mut i64
+    last_output: mut ref u8
+}
+
+val MARKER: ref u8 = "@@PHANTOM_LLDB_END_a91c@@"
+val MARKER_CMD: ref u8 = "script print(\"\".join(map(chr,[64,64,80,72,65,78,84,79,77,95,76,76,68,66,95,69,78,68,95,97,57,49,99,64,64])))"
+
+fn argv_new() list[ref u8] = trust {
+    return @listalloc[allocators.HeapAllocator, ref u8](util.heap())?
+}
+
+/// Start an LLDB process and select `program` as its target.
+pub fn new(lldb_path: ref u8, program: ref u8) result[ref LldbSession, ref u8] = trust {
+    val lldb_cmd: mut ref u8 = lldb_path
+    if lldb_cmd == none || string.len_raw(lldb_cmd) == 0 {
+        lldb_cmd = "lldb"
+    }
+    val argv: mut list[ref u8] = argv_new()
+    @append(argv, lldb_cmd)
+    @append(argv, "--no-lldbinit")
+    val nullp: ref u8 = none
+    @append(argv, nullp)
+    val child_opt = proc.spawn(argv)
+    val child: mut ref proc.Child = none
+    match child_opt {
+        err e => {
+            return err @fmtalloc("could not start lldb: {s}", {e})
+        }
+        ok c => {
+            child = c
+        }
+    }
+    val s: mut ref LldbSession = @alloc(@sizeof(LldbSession)) as ref LldbSession
+    @memset(s, 0, @sizeof(LldbSession) as usize)
+    s.child = child
+    s.program = program
+    s.alive = true
+    s.stopped = false
+    s.exited = false
+    s.exit_code = 0
+    s.last_output = ""
+    // Give lldb's line editor a moment to attach to the pipe before we start
+    // feeding commands. This avoids a startup race on non-tty stdin.
+    when posix {
+        usleep(50000 as u32)
+    }
+    // Flush the startup banner.
+    command(s, "settings set interpreter.prompt-on-quit false")
+    command(s, "settings set target.x86-disassembly-flavor intel")
+    val tar: ref u8 = @fmtalloc("target create -- \"{s}\"", {program})
+    val out: ref u8 = command(s, tar)
+    if util.contains(out, "error:") {
+        return err @fmtalloc("lldb could not load '{s}'", {program})
+    }
+    return ok s
+}
+
+/// Send one command to lldb and return all output produced before it stopped.
+pub fn command(s: mut ref LldbSession, cmd: ref u8) ref u8 = trust {
+    if s == none || !s.alive {
+        return ""
+    }
+    if !proc.write_all(s.child.in_fd, cmd, string.len_raw(cmd)) {
+        s.alive = false
+        return ""
+    }
+    if !proc.write_all(s.child.in_fd, "\n", 1) {
+        s.alive = false
+        return ""
+    }
+    if !proc.write_all(s.child.in_fd, MARKER_CMD, string.len_raw(MARKER_CMD)) {
+        s.alive = false
+        return ""
+    }
+    if !proc.write_all(s.child.in_fd, "\n", 1) {
+        s.alive = false
+        return ""
+    }
+    val out: ref u8 = proc.read_until(s.child.out_fd, MARKER, 8 * 1024 * 1024)
+    s.last_output = out
+    update_state(s, out)
+    return out
+}
+
+fn update_state(s: mut ref LldbSession, out: ref u8) void = trust {
+    if util.contains(out, "Cannot launch") || util.contains(out, "ptrace failed") {
+        s.stopped = false
+        s.exited = true
+        s.exit_code = 1
+        return
+    }
+    if util.contains(out, "exited with status") || util.contains(out, "exited normally") {
+        s.stopped = false
+        s.exited = true
+        s.exit_code = parse_exit_code(out)
+        return
+    }
+    if util.contains(out, "stop reason =") || util.contains(out, "Process ") && util.contains(out, "stopped") {
+        s.stopped = true
+        s.exited = false
+        return
+    }
+    if util.contains(out, "error:") {
+        return
+    }
+}
+
+fn parse_exit_code(out: ref u8) i64 = trust {
+    val marker: ref u8 = "exited with status = "
+    val n: i64 = string.len_raw(out)
+    val m: i64 = string.len_raw(marker)
+    val i: mut i64 = 0
+    for {
+        if i > n - m {
+            break
+        }
+        val matched: mut bool = true
+        val j: mut i64 = 0
+        for {
+            if j >= m {
+                break
+            }
+            if @load8(@ptradd(out, i + j)) != @load8(@ptradd(marker, j)) {
+                matched = false
+                break
+            }
+            j++
+        }
+        if matched {
+            val val_opt = util.parse_i64(util.copy_cstr_len(@ptradd(out, i + m), 32))
+            if val_opt is some v {
+                return v
+            }
+            break
+        }
+        i++
+    }
+    return 0
+}
+
+/// Strip lldb's command echo and Phantom's internal marker commands.
+pub fn clean_output(out: ref u8) ref u8 = trust {
+    if out == none {
+        return ""
+    }
+    val sb: ref void = string.StringBuilder.new()
+    val n: i64 = string.len_raw(out)
+    val pos: mut i64 = 0
+    for {
+        if pos >= n {
+            break
+        }
+        val end: mut i64 = pos
+        for {
+            if end >= n || @load8(@ptradd(out, end)) == 10 {
+                break
+            }
+            end++
+        }
+        val line: ref u8 = util.copy_cstr_len(@ptradd(out, pos), end - pos)
+        val skip: bool = string.str_eql(line, MARKER) ||
+        string.raw_starts_with(line, "script print(\"\".join") ||
+        string.raw_starts_with(line, "(lldb) script print")
+        if !skip {
+            if string.raw_starts_with(line, "(lldb) ") {
+                string.StringBuilder.append_cstr(sb, @ptradd(line, 7))
+            } else {
+                string.StringBuilder.append_cstr(sb, line)
+            }
+            string.StringBuilder.append_char(sb, 10)
+        }
+        pos = end + 1
+    }
+    val built: string.String = string.StringBuilder.build(sb)
+    val res: ref u8 = util.copy_cstr(string.cstr(built))
+    string.StringBuilder.free(sb)
+    return res
+}
+
+/// Launch the target with optional arguments.
+pub fn run(s: mut ref LldbSession, args: list[ref u8]) ref u8 = trust {
+    val sb: ref void = string.StringBuilder.new()
+    string.StringBuilder.append_cstr(sb, "process launch")
+    for a in args {
+        string.StringBuilder.append_cstr(sb, " \"")
+        string.StringBuilder.append_cstr(sb, a)
+        string.StringBuilder.append_cstr(sb, "\"")
+    }
+    val built: string.String = string.StringBuilder.build(sb)
+    val cmd: ref u8 = util.copy_cstr(string.cstr(built))
+    string.StringBuilder.free(sb)
+    return command(s, cmd)
+}
+
+pub fn cont(s: mut ref LldbSession) ref u8 = trust {
+    return command(s, "process continue")
+}
+
+pub fn next(s: mut ref LldbSession) ref u8 = trust {
+    return command(s, "thread step-over")
+}
+
+pub fn step(s: mut ref LldbSession) ref u8 = trust {
+    return command(s, "thread step-in")
+}
+
+pub fn finish(s: mut ref LldbSession) ref u8 = trust {
+    return command(s, "thread step-out")
+}
+
+pub fn breakpoint_symbol(s: mut ref LldbSession, name: ref u8) ref u8 = trust {
+    return command(s, @fmtalloc("breakpoint set --name {s}", {name}))
+}
+
+pub fn breakpoint_file_line(s: mut ref LldbSession, file: ref u8, line: i64) ref u8 = trust {
+    return command(s, @fmtalloc("breakpoint set --file {s} --line {lld}", {util.basename(file), line}))
+}
+
+pub fn breakpoint_address(s: mut ref LldbSession, address: u64) ref u8 = trust {
+    return command(s, @fmtalloc("breakpoint set --address 0x{x}", {address}))
+}
+
+pub fn delete_breakpoint(s: mut ref LldbSession, id: i64) ref u8 = trust {
+    return command(s, @fmtalloc("breakpoint delete {lld}", {id}))
+}
+
+pub fn list_breakpoints(s: mut ref LldbSession) ref u8 = trust {
+    return command(s, "breakpoint list")
+}
+
+pub fn backtrace(s: mut ref LldbSession, count: i64) ref u8 = trust {
+    return command(s, @fmtalloc("thread backtrace -c {lld}", {count}))
+}
+
+pub fn frame_variables(s: mut ref LldbSession) ref u8 = trust {
+    return command(s, "frame variable --show-types")
+}
+
+pub fn expression(s: mut ref LldbSession, expr: ref u8) ref u8 = trust {
+    return command(s, @fmtalloc("expression -- {s}", {expr}))
+}
+
+pub fn threads(s: mut ref LldbSession) ref u8 = trust {
+    return command(s, "thread list")
+}
+
+pub fn source_line(s: mut ref LldbSession, line: i64) ref u8 = trust {
+    return command(s, @fmtalloc("source list --line {lld}", {line}))
+}
+
+pub fn quit(s: mut ref LldbSession) void = trust {
+    if s == none || !s.alive {
+        return
+    }
+    command(s, "process kill")
+    command(s, "quit")
+    proc.terminate(s.child)
+    s.alive = false
+}
+
+fn find_char(s: ref u8, start: i64, ch: u8) i64 = trust {
+    val n: i64 = string.len_raw(s)
+    val i: mut i64 = start
+    for {
+        if i >= n {
+            return -1
+        }
+        if @load8(@ptradd(s, i)) == ch {
+            return i
+        }
+        i++
+    }
+    return -1
+}
+
+/// Parse the `frame #N:` rows from a backtrace or stop message.
+pub fn parse_frames(out: ref u8) list[ref LldbFrame] = trust {
+    val frames: mut list[ref LldbFrame] = @listalloc[allocators.HeapAllocator, ref LldbFrame](util.heap())?
+    val n: i64 = string.len_raw(out)
+    val pos: mut i64 = 0
+    for {
+        if pos >= n {
+            break
+        }
+        val end: mut i64 = pos
+        for {
+            if end >= n || @load8(@ptradd(out, end)) == 10 {
+                break
+            }
+            end++
+        }
+        val line: ref u8 = util.copy_cstr_len(@ptradd(out, pos), end - pos)
+        if util.contains(line, "frame #") {
+            val f: ref LldbFrame = parse_frame_line(line)
+            if f != none {
+                @append(frames, f)
+            }
+        }
+        pos = end + 1
+    }
+    return frames
+}
+
+fn parse_frame_line(line: ref u8) ref LldbFrame = trust {
+    val fpos: i64 = index_of(line, "frame #")
+    if fpos < 0 {
+        return none
+    }
+    val f: mut ref LldbFrame = @alloc(@sizeof(LldbFrame)) as ref LldbFrame
+    @memset(f, 0, @sizeof(LldbFrame) as usize)
+    val p: mut i64 = fpos + 7
+    val idx: mut i64 = 0
+    val n: i64 = string.len_raw(line)
+    for {
+        if p >= n {
+            break
+        }
+        val c: u8 = @load8(@ptradd(line, p))
+        if c < 48 || c > 57 {
+            break
+        }
+        idx = idx * 10 + ((c - 48) as i64)
+        p++
+    }
+    f.index = idx
+    val bt: i64 = find_char(line, p, 96)
+    if bt < 0 {
+        return f
+    }
+    // Address is the last token before the backtick.
+    val apos: mut i64 = bt - 1
+    for {
+        if apos < 0 {
+            break
+        }
+        val c: u8 = @load8(@ptradd(line, apos))
+        if c == 32 {
+            break
+        }
+        apos--
+    }
+    val addr_txt: ref u8 = util.copy_cstr_len(@ptradd(line, apos + 1), bt - apos - 1)
+    val addr_opt = util.parse_u64_hex(addr_txt)
+    if addr_opt is some av {
+        f.address = av
+    }
+    // Symbol ends at '(' or whitespace.
+    val send: mut i64 = bt + 1
+    for {
+        if send >= n {
+            break
+        }
+        val c: u8 = @load8(@ptradd(line, send))
+        if c == 40 || c == 32 || c == 43 {
+            break
+        }
+        send++
+    }
+    f.function_raw = util.copy_cstr_len(@ptradd(line, bt + 1), send - bt - 1)
+    f.function_display = demangle.pretty(f.function_raw)
+    if string.len_raw(f.function_display) == 0 {
+        f.function_display = f.function_raw
+    }
+    val atpos: i64 = index_sub(line, " at ", send)
+    if atpos >= 0 {
+        val sstart: i64 = atpos + 4
+        val colon: mut i64 = -1
+        val i: mut i64 = sstart
+        for {
+            if i >= n {
+                break
+            }
+            val c: u8 = @load8(@ptradd(line, i))
+            if c == 58 {
+                colon = i
+                // Prefer the last colon: path may not contain one, but a
+                // Windows drive letter can.
+            }
+            i++
+        }
+        if colon > sstart {
+            f.file = util.copy_cstr_len(@ptradd(line, sstart), colon - sstart)
+            val lstart: i64 = colon + 1
+            val line_no: mut i64 = 0
+            val j: mut i64 = lstart
+            for {
+                if j >= n {
+                    break
+                }
+                val c: u8 = @load8(@ptradd(line, j))
+                if c < 48 || c > 57 {
+                    break
+                }
+                line_no = line_no * 10 + ((c - 48) as i64)
+                j++
+            }
+            f.line = line_no
+            if j < n && @load8(@ptradd(line, j)) == 58 {
+                val col: mut i64 = 0
+                val k: mut i64 = j + 1
+                for {
+                    if k >= n {
+                        break
+                    }
+                    val c: u8 = @load8(@ptradd(line, k))
+                    if c < 48 || c > 57 {
+                        break
+                    }
+                    col = col * 10 + ((c - 48) as i64)
+                    k++
+                }
+                f.column = col
+            }
+        }
+    }
+    return f
+}
+
+fn index_of(s: ref u8, needle: ref u8) i64 = trust {
+    return index_sub(s, needle, 0)
+}
+
+fn index_sub(s: ref u8, needle: ref u8, start: i64) i64 = trust {
+    val n: i64 = string.len_raw(s)
+    val m: i64 = string.len_raw(needle)
+    if m <= 0 || n < m {
+        return -1
+    }
+    val i: mut i64 = start
+    for {
+        if i > n - m {
+            break
+        }
+        val matched: mut bool = true
+        val j: mut i64 = 0
+        for {
+            if j >= m {
+                break
+            }
+            if @load8(@ptradd(s, i + j)) != @load8(@ptradd(needle, j)) {
+                matched = false
+                break
+            }
+            j++
+        }
+        if matched {
+            return i
+        }
+        i++
+    }
+    return -1
+}
+
+/// Parse `frame variable` output into source-friendly variable records.
+pub fn parse_variables(out: ref u8) list[ref LldbVar] = trust {
+    val vars: mut list[ref LldbVar] = @listalloc[allocators.HeapAllocator, ref LldbVar](util.heap())?
+    val n: i64 = string.len_raw(out)
+    val pos: mut i64 = 0
+    for {
+        if pos >= n {
+            break
+        }
+        val end: mut i64 = pos
+        for {
+            if end >= n || @load8(@ptradd(out, end)) == 10 {
+                break
+            }
+            end++
+        }
+        val line: ref u8 = util.copy_cstr_len(@ptradd(out, pos), end - pos)
+        if string.len_raw(line) > 0 && @load8(line) == 40 {
+            val rp: i64 = find_char(line, 0, 41)
+            if rp > 0 {
+                val v: mut ref LldbVar = @alloc(@sizeof(LldbVar)) as ref LldbVar
+                @memset(v, 0, @sizeof(LldbVar) as usize)
+                v.type_name = util.copy_cstr_len(@ptradd(line, 1), rp - 1)
+                val name_start: mut i64 = rp + 1
+                for {
+                    if name_start >= end - pos {
+                        break
+                    }
+                    val c: u8 = @load8(@ptradd(line, name_start))
+                    if c != 32 && c != 9 {
+                        break
+                    }
+                    name_start++
+                }
+                val eq: i64 = find_char(line, name_start, 61)
+                val name_end: mut i64 = eq
+                if name_end < 0 {
+                    name_end = string.len_raw(line)
+                }
+                val trim_end: mut i64 = name_end
+                for {
+                    if trim_end <= name_start {
+                        break
+                    }
+                    val c: u8 = @load8(@ptradd(line, trim_end - 1))
+                    if c != 32 && c != 9 {
+                        break
+                    }
+                    trim_end--
+                }
+                v.raw_name = util.copy_cstr_len(@ptradd(line, name_start), trim_end - name_start)
+                v.name = demangle.source_name(v.raw_name)
+                if eq >= 0 {
+                    val vs: mut i64 = eq + 1
+                    for {
+                        if vs >= string.len_raw(line) {
+                            break
+                        }
+                        val c: u8 = @load8(@ptradd(line, vs))
+                        if c != 32 && c != 9 {
+                            break
+                        }
+                        vs++
+                    }
+                    v.value = util.copy_cstr_len(@ptradd(line, vs), string.len_raw(line) - vs)
+                }
+                @append(vars, v)
+            }
+        }
+        pos = end + 1
+    }
+    return vars
+}
+
+/// Rewrite source-level identifiers in an expression to the compiler's
+/// internal (`t_`, `sx__`) names as reported by the current frame.
+pub fn rewrite_expression(s: mut ref LldbSession, expr: ref u8) ref u8 = trust {
+    if expr == none {
+        return ""
+    }
+    val vars: list[ref LldbVar] = parse_variables(clean_output(frame_variables(s)))
+    if @len(vars) == 0 {
+        return expr
+    }
+    val out: ref u8 = @alloc((string.len_raw(expr) * 2 + 32) as usize) as ref u8
+    @memset(out, 0, (string.len_raw(expr) * 2 + 32) as usize)
+    val n: i64 = string.len_raw(expr)
+    val i: mut i64 = 0
+    val oi: mut i64 = 0
+    for {
+        if i >= n {
+            break
+        }
+        val c: u8 = @load8(@ptradd(expr, i))
+        val ident_start: bool = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+        if ident_start {
+            val start: i64 = i
+            val j: mut i64 = i + 1
+            for {
+                if j >= n {
+                    break
+                }
+                val d: u8 = @load8(@ptradd(expr, j))
+                val ident_char: bool = (d >= 65 && d <= 90) || (d >= 97 && d <= 122) ||
+                (d >= 48 && d <= 57) || d == 95
+                if !ident_char {
+                    break
+                }
+                j++
+            }
+            val word: ref u8 = util.copy_cstr_len(@ptradd(expr, start), j - start)
+            val replacement: mut ref u8 = word
+            for v in vars {
+                if string.str_eql(v.name, word) {
+                    replacement = v.raw_name
+                    break
+                }
+            }
+            val rlen: i64 = string.len_raw(replacement)
+            @memcpy(@ptradd(out, oi), replacement, rlen as usize)
+            oi += rlen
+            i = j
+        } else {
+            @store8(@ptradd(out, oi), c)
+            oi++
+            i++
+        }
+    }
+    @store8(@ptradd(out, oi), 0)
+    return out
+}

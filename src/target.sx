@@ -1,0 +1,121 @@
+/// Backend-independent target metadata (ELF symbols + DWARF).
+///
+/// (C) Navid Momtahen - 2026
+/// SPDX-License-Identifier: GPL-3.0-only
+
+val allocators = use("std/allocators")
+val string     = use("std/string")
+val util       = use("util.sx")
+val elf        = use("elf.sx")
+val dwarf      = use("dwarf.sx")
+val demangle   = use("demangle.sx")
+
+pub type Target = {
+    path: mut ref u8
+    elf_file: mut ref elf.ElfFile
+    dwarf_info: mut ref dwarf.DwarfInfo
+}
+
+/// Load metadata for `path`.
+pub fn load(arena: allocators.Arena, path: ref u8) result[ref Target, ref u8] = trust {
+    val e_opt = elf.load(arena, path)
+    val e: mut ref elf.ElfFile = none
+    match e_opt {
+        err er => {
+            return err er
+        }
+        ok ev => {
+            e = ev
+        }
+    }
+    val d_opt = dwarf.load(arena, e)
+    val d: mut ref dwarf.DwarfInfo = none
+    match d_opt {
+        err der => {
+            return err der
+        }
+        ok dv => {
+            d = dv
+        }
+    }
+    val t: mut ref Target = allocators.Arena.alloc_or_none(arena, @sizeof(Target) as usize) as ref Target
+    @memset(t, 0, @sizeof(Target) as usize)
+    t.path = path
+    t.elf_file = e
+    t.dwarf_info = d
+    return ok t
+}
+
+/// Resolve a function name to its raw symbol, or empty when not found.
+pub fn function_raw(t: ref Target, query: ref u8) ref u8 = trust {
+    val f: ref dwarf.DwarfFunction = dwarf.find_function(t.dwarf_info, query)
+    if f != none {
+        return f.name
+    }
+    for sym in t.elf_file.symbols {
+        if elf.symbol_is_code(sym) && demangle.matches(sym.name, query) {
+            return sym.name
+        }
+    }
+    return ""
+}
+
+/// Resolve a function name to its declaration line table address.
+pub fn function_address(t: ref Target, query: ref u8) option[u64] = trust {
+    val f: ref dwarf.DwarfFunction = dwarf.find_function(t.dwarf_info, query)
+    if f != none {
+        for row in t.dwarf_info.lines {
+            if row.address > f.low_pc && row.address < f.high_pc && row.is_stmt {
+                return some row.address
+            }
+        }
+        return some f.low_pc
+    }
+    for sym in t.elf_file.symbols {
+        if elf.symbol_is_code(sym) && demangle.matches(sym.name, query) {
+            return some sym.value
+        }
+    }
+    return none
+}
+
+/// Resolve `file:line` to a source address.
+pub fn line_address(t: ref Target, file: ref u8, line: i64) option[u64] = trust {
+    return dwarf.address_for_line(t.dwarf_info, file, line)
+}
+
+/// Best-effort location for the current process address.
+pub fn location_for_pc(t: ref Target, pc: u64) ref u8 = trust {
+    val row: ref dwarf.DwarfLineRow = dwarf.line_for_pc(t.dwarf_info, pc)
+    if row == none || string.len_raw(row.file) == 0 {
+        return ""
+    }
+    return @fmtalloc("{s}:{lld}", {row.file, row.line})
+}
+
+/// Function display name for a link-time address.
+pub fn function_for_pc(t: ref Target, pc: u64) ref u8 = trust {
+    val f: ref dwarf.DwarfFunction = dwarf.function_for_pc(t.dwarf_info, pc)
+    if f != none {
+        return f.display
+    }
+    val sym_opt = elf.symbol_for_addr(t.elf_file, pc)
+    if sym_opt is some sym {
+        return demangle.pretty(sym.name)
+    }
+    return @fmtalloc("0x{x}", {pc})
+}
+
+/// Return all functions whose display name contains `query`.
+pub fn find_functions(t: ref Target, query: ref u8, limit: i64) list[ref dwarf.DwarfFunction] = trust {
+    val out: mut list[ref dwarf.DwarfFunction] = @listalloc[allocators.HeapAllocator, ref dwarf.DwarfFunction](util.heap())?
+    for f in t.dwarf_info.functions {
+        if demangle.matches(f.name, query) || util.contains(f.display, query) {
+            @append(out, f)
+            if (@len(out) as i64) >= limit {
+                break
+            }
+        }
+    }
+    return out
+}

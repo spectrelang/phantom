@@ -1,0 +1,1399 @@
+/// Minimal DWARF 4/5 reader for Phantom's native inspection backend.
+///
+/// (C) Navid Momtahen - 2026
+/// SPDX-License-Identifier: GPL-3.0-only
+
+val string     = use("std/string")
+val allocators = use("std/allocators")
+val elf        = use("elf.sx")
+val util       = use("util.sx")
+val demangle   = use("demangle.sx")
+
+val (
+    TAG_ARRAY_TYPE: u64 = 1
+    TAG_ENUMERATION_TYPE: u64 = 4
+    TAG_FORMAL_PARAMETER: u64 = 5
+    TAG_LEXICAL_BLOCK: u64 = 11
+    TAG_MEMBER: u64 = 13
+    TAG_POINTER_TYPE: u64 = 15
+    TAG_COMPILE_UNIT: u64 = 17
+    TAG_STRUCTURE_TYPE: u64 = 19
+    TAG_TYPEDEF: u64 = 22
+    TAG_UNION_TYPE: u64 = 23
+    TAG_SUBRANGE_TYPE: u64 = 33
+    TAG_BASE_TYPE: u64 = 36
+    TAG_SUBPROGRAM: u64 = 46
+    TAG_VARIABLE: u64 = 52
+    TAG_ENUMERATOR: u64 = 40
+    TAG_CONST_TYPE: u64 = 38
+    TAG_INLINED_SUBROUTINE: u64 = 29
+)
+
+val (
+    AT_LOCATION: u64 = 2
+    AT_NAME: u64 = 3
+    AT_BYTE_SIZE: u64 = 11
+    AT_STMT_LIST: u64 = 16
+    AT_LOW_PC: u64 = 17
+    AT_HIGH_PC: u64 = 18
+    AT_COMP_DIR: u64 = 27
+    AT_CONST_VALUE: u64 = 28
+    AT_LOWER_BOUND: u64 = 34
+    AT_COUNT: u64 = 55
+    AT_DATA_MEMBER_LOCATION: u64 = 56
+    AT_DECL_FILE: u64 = 58
+    AT_DECL_LINE: u64 = 59
+    AT_ENCODING: u64 = 62
+    AT_FRAME_BASE: u64 = 64
+    AT_TYPE: u64 = 73
+    AT_UPPER_BOUND: u64 = 47
+    AT_STR_OFFSETS_BASE: u64 = 114
+    AT_ADDR_BASE: u64 = 115
+)
+
+pub type DwarfAttr = {
+    at: mut u64
+    form: mut u64
+    u: mut u64
+    s: mut i64
+    str: mut ref u8
+    expr_off: mut u64
+    expr_len: mut u64
+    is_expr: mut bool
+    is_str: mut bool
+    is_ref: mut bool
+}
+
+pub type DwarfAbbrevAttr = {
+    at: mut u64
+    form: mut u64
+    implicit: mut i64
+}
+
+pub type DwarfAbbrev = {
+    code: mut u64
+    tag: mut u64
+    children: mut bool
+    attrs: mut list[ref DwarfAbbrevAttr]
+}
+
+pub type DwarfCu = {
+    base: mut u64
+    offset: mut u64
+    end: mut u64
+    version: mut u16
+    addr_size: mut u8
+    offset_size: mut u8
+    abbrev_off: mut u64
+    str_offsets_base: mut u64
+    addr_base: mut u64
+    low_pc: mut u64
+    high_pc: mut u64
+    name: mut ref u8
+    comp_dir: mut ref u8
+    stmt_list: mut u64
+    root: mut ref DwarfDie
+}
+
+pub type DwarfDie = {
+    offset: mut u64
+    tag: mut u64
+    depth: mut i64
+    parent: mut ref DwarfDie
+    children: mut list[ref DwarfDie]
+    attrs: mut list[ref DwarfAttr]
+    cu: mut ref DwarfCu
+}
+
+pub type DwarfLineRow = {
+    address: mut u64
+    file: mut ref u8
+    file_index: mut u64
+    line: mut i64
+    column: mut i64
+    is_stmt: mut bool
+}
+
+pub type DwarfMember = {
+    name: mut ref u8
+    type_off: mut u64
+    offset: mut u64
+}
+
+pub type DwarfType = {
+    offset: mut u64
+    tag: mut u64
+    name: mut ref u8
+    byte_size: mut i64
+    encoding: mut u64
+    type_off: mut u64
+    count: mut i64
+    members: mut list[ref DwarfMember]
+    die: mut ref DwarfDie
+}
+
+pub type DwarfVariable = {
+    name: mut ref u8
+    source_name: mut ref u8
+    type_off: mut u64
+    file: mut ref u8
+    line: mut i64
+    loc_off: mut u64
+    loc_len: mut u64
+    frame_off: mut u64
+    frame_len: mut u64
+    die: mut ref DwarfDie
+}
+
+pub type DwarfFunction = {
+    name: mut ref u8
+    display: mut ref u8
+    low_pc: mut u64
+    high_pc: mut u64
+    frame_off: mut u64
+    frame_len: mut u64
+    file: mut ref u8
+    line: mut i64
+    variables: mut list[ref DwarfVariable]
+    die: mut ref DwarfDie
+}
+
+pub type DwarfInfo = {
+    elf: mut ref elf.ElfFile
+    arena: mut allocators.Arena
+    info_data: mut ref u8
+    info_size: mut u64
+    abbrev_data: mut ref u8
+    abbrev_size: mut u64
+    str_data: mut ref u8
+    str_size: mut u64
+    line_str_data: mut ref u8
+    line_str_size: mut u64
+    addr_data: mut ref u8
+    addr_size: mut u64
+    str_offsets_data: mut ref u8
+    str_offsets_size: mut u64
+    line_data: mut ref u8
+    line_size: mut u64
+    cus: mut list[ref DwarfCu]
+    dies: mut list[ref DwarfDie]
+    functions: mut list[ref DwarfFunction]
+    variables: mut list[ref DwarfVariable]
+    types: mut list[ref DwarfType]
+    lines: mut list[ref DwarfLineRow]
+    files: mut list[ref u8]
+}
+
+fn section_ptr(e: ref elf.ElfFile, name: ref u8) ref u8 = trust {
+    val opt = elf.section_by_name(e, name)
+    if opt is some sec {
+        return elf.section_data(e, sec as ref elf.ElfSection)
+    }
+    return none
+}
+
+fn section_size(e: ref elf.ElfFile, name: ref u8) u64 = trust {
+    val opt = elf.section_by_name(e, name)
+    if opt is some sec {
+        return (sec as ref elf.ElfSection).size
+    }
+    return 0
+}
+
+fn read_uint(data: ref u8, off: u64, size: u8) u64 = trust {
+    if size == 1 {
+        return @load8(@ptradd(data, off as i64)) as u64
+    }
+    if size == 2 {
+        return util.read_u16(data, off) as u64
+    }
+    if size == 4 {
+        return util.read_u32(data, off) as u64
+    }
+    if size == 8 {
+        return util.read_u64(data, off)
+    }
+    return 0
+}
+
+fn new_attr(arena: allocators.Arena, at: u64, form: u64) ref DwarfAttr = trust {
+    val a: mut ref DwarfAttr = allocators.Arena.alloc_or_none(
+        arena,
+        @sizeof(DwarfAttr) as usize
+    ) as ref DwarfAttr
+    @memset(a, 0, @sizeof(DwarfAttr) as usize)
+    a.at = at
+    a.form = form
+    return a
+}
+
+fn new_die(
+    arena: allocators.Arena,
+    offset: u64,
+    tag: u64,
+    depth: i64,
+    cu: ref DwarfCu
+) ref DwarfDie = trust {
+    val d: mut ref DwarfDie = allocators.Arena.alloc_or_none(
+        arena,
+        @sizeof(DwarfDie) as usize
+    ) as ref DwarfDie
+    @memset(d, 0, @sizeof(DwarfDie) as usize)
+    d.offset = offset
+    d.tag = tag
+    d.depth = depth
+    d.cu = cu
+    d.children = @listalloc[allocators.HeapAllocator, ref DwarfDie](util.heap())?
+    d.attrs = @listalloc[allocators.HeapAllocator, ref DwarfAttr](util.heap())?
+    return d
+}
+
+fn find_abbrev(abbrevs: list[ref DwarfAbbrev], code: u64) ref DwarfAbbrev = trust {
+    for a in abbrevs {
+        if a.code == code {
+            return a
+        }
+    }
+    return none
+}
+
+fn parse_abbrevs(
+    info: ref DwarfInfo,
+    offset: u64
+) list[ref DwarfAbbrev] = trust {
+    val out: mut list[ref DwarfAbbrev] = @listalloc[allocators.HeapAllocator, ref DwarfAbbrev](util.heap())?
+    val data: ref u8 = info.abbrev_data
+    val size: u64 = info.abbrev_size
+    val pos: mut u64 = offset
+    for {
+        if pos >= size {
+            break
+        }
+        val code: u64 = util.read_uleb(data, pos)
+        pos += util.uleb_len(data, pos)
+        if code == 0 {
+            break
+        }
+        val tag: u64 = util.read_uleb(data, pos)
+        pos += util.uleb_len(data, pos)
+        val children: u8 = @load8(@ptradd(data, pos as i64))
+        pos++
+        val ab: mut ref DwarfAbbrev = allocators.Arena.alloc_or_none(
+            info.arena,
+            @sizeof(DwarfAbbrev) as usize
+        ) as ref DwarfAbbrev
+        @memset(ab, 0, @sizeof(DwarfAbbrev) as usize)
+        ab.code = code
+        ab.tag = tag
+        ab.children = children != 0
+        ab.attrs = @listalloc[allocators.HeapAllocator, ref DwarfAbbrevAttr](util.heap())?
+        for {
+            val at: u64 = util.read_uleb(data, pos)
+            pos += util.uleb_len(data, pos)
+            val form: u64 = util.read_uleb(data, pos)
+            pos += util.uleb_len(data, pos)
+            if at == 0 && form == 0 {
+                break
+            }
+            val aa: mut ref DwarfAbbrevAttr = allocators.Arena.alloc_or_none(
+                info.arena,
+                @sizeof(DwarfAbbrevAttr) as usize
+            ) as ref DwarfAbbrevAttr
+            @memset(aa, 0, @sizeof(DwarfAbbrevAttr) as usize)
+            aa.at = at
+            aa.form = form
+            if form == 33 {
+                aa.implicit = util.read_sleb(data, pos)
+                pos += util.sleb_len(data, pos)
+            }
+            @append(ab.attrs, aa)
+        }
+        @append(out, ab)
+    }
+    return out
+}
+
+fn str_offset_from_index(info: ref DwarfInfo, cu: ref DwarfCu, index: u64) u64 = trust {
+    if info.str_offsets_data == none {
+        return 0
+    }
+    val base: u64 = cu.str_offsets_base
+    val off: u64 = base + index * (cu.offset_size as u64)
+    return read_uint(info.str_offsets_data, off, cu.offset_size)
+}
+
+fn addr_from_index(info: ref DwarfInfo, cu: ref DwarfCu, index: u64) u64 = trust {
+    if info.addr_data == none {
+        return 0
+    }
+    val off: u64 = cu.addr_base + index * (cu.addr_size as u64)
+    return read_uint(info.addr_data, off, cu.addr_size)
+}
+
+fn line_str_at(info: ref DwarfInfo, off: u64) ref u8 = trust {
+    if info.line_str_data == none || off >= info.line_str_size {
+        return ""
+    }
+    return @ptradd(info.line_str_data, off as i64)
+}
+
+fn str_at(info: ref DwarfInfo, off: u64) ref u8 = trust {
+    if info.str_data == none || off >= info.str_size {
+        return ""
+    }
+    return @ptradd(info.str_data, off as i64)
+}
+
+fn decode_strx(info: ref DwarfInfo, cu: ref DwarfCu, index: u64) ref u8 = trust {
+    val off: u64 = str_offset_from_index(info, cu, index)
+    return str_at(info, off)
+}
+
+/// Read a form value. Returns the offset after the form data.
+fn read_form(
+    info: ref DwarfInfo,
+    cu: ref DwarfCu,
+    form_in: u64,
+    pos_in: u64,
+    implicit: i64,
+    out: mut ref DwarfAttr
+) u64 = trust {
+    val data: ref u8 = info.info_data
+    val form: mut u64 = form_in
+    val pos: mut u64 = pos_in
+    if form == 22 {
+        form = util.read_uleb(data, pos)
+        pos += util.uleb_len(data, pos)
+        out.form = form
+    }
+    out.form = form
+    if form == 1 {
+        out.u = read_uint(data, pos, cu.addr_size)
+        pos += cu.addr_size as u64
+    } elif form == 3 || form == 4 || form == 9 || form == 10 {
+        // block2 / block4 / block / block1
+        val len: mut u64 = 0
+        if form == 3 {
+            len = read_uint(data, pos, 2)
+            pos += 2
+        } elif form == 4 {
+            len = read_uint(data, pos, 4)
+            pos += 4
+        } elif form == 10 {
+            len = read_uint(data, pos, 1)
+            pos += 1
+        } else {
+            len = util.read_uleb(data, pos)
+            pos += util.uleb_len(data, pos)
+        }
+        out.expr_off = pos
+        out.expr_len = len
+        out.is_expr = true
+        pos += len
+    } elif form == 5 {
+        out.u = read_uint(data, pos, 2)
+        pos += 2
+    } elif form == 6 {
+        out.u = read_uint(data, pos, 4)
+        pos += 4
+    } elif form == 7 {
+        out.u = read_uint(data, pos, 8)
+        pos += 8
+    } elif form == 8 {
+        out.str = @ptradd(data, pos as i64)
+        out.is_str = true
+        pos += (string.len_raw(out.str) + 1) as u64
+    } elif form == 11 {
+        out.u = read_uint(data, pos, 1)
+        pos += 1
+    } elif form == 12 {
+        out.u = read_uint(data, pos, 1)
+        pos += 1
+    } elif form == 13 {
+        out.s = util.read_sleb(data, pos)
+        out.u = out.s as u64
+        pos += util.sleb_len(data, pos)
+    } elif form == 14 {
+        val off: u64 = read_uint(data, pos, cu.offset_size)
+        out.u = off
+        out.str = str_at(info, off)
+        out.is_str = true
+        pos += cu.offset_size as u64
+    } elif form == 15 {
+        out.u = util.read_uleb(data, pos)
+        pos += util.uleb_len(data, pos)
+    } elif form == 16 {
+        out.u = read_uint(data, pos, cu.addr_size)
+        pos += cu.addr_size as u64
+        out.is_ref = true
+    } elif form == 17 || form == 18 || form == 19 || form == 20 || form == 21 {
+        val sz: mut u8 = 1
+        if form == 18 {
+            sz = 2
+        } elif form == 19 {
+            sz = 4
+        } elif form == 20 {
+            sz = 8
+        } elif form == 21 {
+            out.u = util.read_uleb(data, pos)
+            pos += util.uleb_len(data, pos)
+            out.is_ref = true
+            return pos
+        }
+        out.u = read_uint(data, pos, sz)
+        pos += sz as u64
+        out.is_ref = true
+    } elif form == 23 {
+        out.u = read_uint(data, pos, cu.offset_size)
+        pos += cu.offset_size as u64
+    } elif form == 24 {
+        val len: u64 = util.read_uleb(data, pos)
+        pos += util.uleb_len(data, pos)
+        out.expr_off = pos
+        out.expr_len = len
+        out.is_expr = true
+        pos += len
+    } elif form == 25 {
+        out.u = 1
+    } elif form == 26 {
+        out.u = util.read_uleb(data, pos)
+        pos += util.uleb_len(data, pos)
+        out.str = decode_strx(info, cu, out.u)
+        out.is_str = true
+    } elif form == 27 {
+        out.u = util.read_uleb(data, pos)
+        pos += util.uleb_len(data, pos)
+        out.u = addr_from_index(info, cu, out.u)
+    } elif form == 30 {
+        out.u = read_uint(data, pos, 16)
+        pos += 16
+    } elif form == 31 {
+        val off: u64 = read_uint(data, pos, cu.offset_size)
+        out.u = off
+        out.str = line_str_at(info, off)
+        out.is_str = true
+        pos += cu.offset_size as u64
+    } elif form == 32 {
+        out.u = read_uint(data, pos, 8)
+        pos += 8
+    } elif form == 33 {
+        out.s = implicit
+        out.u = implicit as u64
+    } elif form == 37 || form == 38 || form == 39 || form == 40 {
+        val sz: mut u8 = 1
+        if form == 38 {
+            sz = 2
+        } elif form == 39 {
+            sz = 3
+        } elif form == 40 {
+            sz = 4
+        }
+        out.u = util.read_uleb(data, pos)
+        pos += util.uleb_len(data, pos)
+        out.str = decode_strx(info, cu, out.u)
+        out.is_str = true
+    } elif form == 41 || form == 42 || form == 43 || form == 44 {
+        out.u = util.read_uleb(data, pos)
+        pos += util.uleb_len(data, pos)
+        out.u = addr_from_index(info, cu, out.u)
+    } else {
+        // Unknown form: stop parsing this DIE's attributes conservatively.
+        return pos
+    }
+    return pos
+}
+
+fn attr_by_name(die: ref DwarfDie, at: u64) ref DwarfAttr = trust {
+    for a in die.attrs {
+        if a.at == at {
+            return a
+        }
+    }
+    return none
+}
+
+fn attr_str(die: ref DwarfDie, at: u64) ref u8 = trust {
+    val a: ref DwarfAttr = attr_by_name(die, at)
+    if a == none {
+        return ""
+    }
+    if a.is_str {
+        return a.str
+    }
+    return ""
+}
+
+fn attr_u(die: ref DwarfDie, at: u64) u64 = trust {
+    val a: ref DwarfAttr = attr_by_name(die, at)
+    if a == none {
+        return 0
+    }
+    return a.u
+}
+
+fn attr_s(die: ref DwarfDie, at: u64) i64 = trust {
+    val a: ref DwarfAttr = attr_by_name(die, at)
+    if a == none {
+        return 0
+    }
+    if a.form == 13 {
+        return a.s
+    }
+    return a.u as i64
+}
+
+fn attr_type_off(die: ref DwarfDie) u64 = trust {
+    val a: ref DwarfAttr = attr_by_name(die, AT_TYPE)
+    if a == none {
+        return 0
+    }
+    if a.form == 16 {
+        return a.u
+    }
+    return die.cu.base + a.u
+}
+
+fn parse_die_tree(info: mut ref DwarfInfo, cu: mut ref DwarfCu) void = trust {
+    val abbrevs: list[ref DwarfAbbrev] = parse_abbrevs(info, cu.abbrev_off)
+    val data: ref u8 = info.info_data
+    val pos: mut u64 = cu.offset
+    val depth: mut i64 = 0
+    val stack: mut list[ref DwarfDie] = @listalloc[allocators.HeapAllocator, ref DwarfDie](util.heap())?
+    val root: mut ref DwarfDie = none
+    for {
+        if pos >= cu.end {
+            break
+        }
+        val die_off: u64 = pos
+        val code: u64 = util.read_uleb(data, pos)
+        pos += util.uleb_len(data, pos)
+        if code == 0 {
+            if @len(stack) > 0 {
+                @remove(stack, (@len(stack) as i64) - 1)
+            }
+            if @len(stack) == 0 && root != none {
+                break
+            }
+            continue
+        }
+        val ab: ref DwarfAbbrev = find_abbrev(abbrevs, code)
+        if ab == none {
+            break
+        }
+        val parent: mut ref DwarfDie = none
+        if @len(stack) > 0 {
+            val idx: i64 = (@len(stack) as i64) - 1
+            val p_opt = @get(stack, idx as usize)
+            if p_opt is some pv {
+                parent = pv as ref DwarfDie
+            }
+        }
+        val die: mut ref DwarfDie = new_die(info.arena, die_off, ab.tag, depth, cu)
+        die.parent = parent
+        if parent != none {
+            @append(parent.children, die)
+        }
+        if root == none {
+            root = die
+            cu.root = die
+        }
+        @append(info.dies, die)
+
+        // Attribute values are read in order. DWARF5 bases appear before the
+        // attributes that need them on the compile-unit DIE.
+        for aa in ab.attrs {
+            val a: mut ref DwarfAttr = new_attr(info.arena, aa.at, aa.form)
+            pos = read_form(info, cu, aa.form, pos, aa.implicit, a)
+            @append(die.attrs, a)
+            if a.at == AT_STR_OFFSETS_BASE {
+                cu.str_offsets_base = a.u
+            } elif a.at == AT_ADDR_BASE {
+                cu.addr_base = a.u
+            } elif a.at == AT_LOW_PC {
+                cu.low_pc = a.u
+            } elif a.at == AT_HIGH_PC {
+                if a.form == 17 || a.form == 18 || a.form == 19 || a.form == 20 {
+                    cu.high_pc = a.u
+                } else {
+                    cu.high_pc = cu.low_pc + a.u
+                }
+            } elif a.at == AT_NAME && a.is_str {
+                cu.name = a.str
+            } elif a.at == AT_COMP_DIR && a.is_str {
+                cu.comp_dir = a.str
+            } elif a.at == AT_STMT_LIST {
+                cu.stmt_list = a.u
+            }
+        }
+        if ab.children {
+            @append(stack, die)
+            depth++
+        }
+    }
+}
+
+fn parse_cus(info: mut ref DwarfInfo) void = trust {
+    val data: ref u8 = info.info_data
+    val pos: mut u64 = 0
+    for {
+        if pos + 11 >= info.info_size {
+            break
+        }
+        val cu_start: u64 = pos
+        val len32: u32 = read_uint(data, pos, 4) as u32
+        pos += 4
+        val len: mut u64 = len32 as u64
+        val offset_size: mut u8 = 4
+        if len32 == 0xffffffff {
+            len = read_uint(data, pos, 8)
+            pos += 8
+            offset_size = 8
+        }
+        if len == 0 || pos + len > info.info_size {
+            break
+        }
+        val end: u64 = pos + len
+        val version: u16 = read_uint(data, pos, 2) as u16
+        pos += 2
+        val abbrev_off: mut u64 = 0
+        val addr_size: mut u8 = 8
+        if version >= 5 {
+            val unit_type: u8 = @load8(@ptradd(data, pos as i64))
+            pos++
+            addr_size = @load8(@ptradd(data, pos as i64))
+            pos++
+            abbrev_off = read_uint(data, pos, offset_size)
+            pos += offset_size as u64
+            if unit_type == 5 || unit_type == 6 {
+                pos += 8
+            }
+        } else {
+            abbrev_off = read_uint(data, pos, offset_size)
+            pos += offset_size as u64
+            addr_size = @load8(@ptradd(data, pos as i64))
+            pos++
+        }
+        val cu: mut ref DwarfCu = allocators.Arena.alloc_or_none(
+            info.arena,
+            @sizeof(DwarfCu) as usize
+        ) as ref DwarfCu
+        @memset(cu, 0, @sizeof(DwarfCu) as usize)
+        cu.base = cu_start
+        cu.offset = pos
+        cu.end = end
+        cu.version = version
+        cu.addr_size = addr_size
+        cu.offset_size = offset_size
+        cu.abbrev_off = abbrev_off
+        @append(info.cus, cu)
+        parse_die_tree(info, cu)
+        pos = end
+    }
+}
+
+fn read_line_form(
+    info: ref DwarfInfo,
+    form: u64,
+    pos_in: u64,
+    out_str: mut ref ref u8,
+    out_num: mut ref u64
+) u64 = trust {
+    val data: ref u8 = info.line_data
+    val pos: mut u64 = pos_in
+    if form == 8 {
+        val sv: ref u8 = @ptradd(data, pos as i64)
+        @store(out_str, sv)
+        pos += (string.len_raw(sv) + 1) as u64
+    } elif form == 31 || form == 14 {
+        val off: u64 = read_uint(data, pos, 4)
+        @store(out_str, line_str_at(info, off))
+        pos += 4
+    } elif form == 15 {
+        val nv: u64 = util.read_uleb(data, pos)
+        @store(out_num, nv)
+        pos += util.uleb_len(data, pos)
+    } elif form == 11 {
+        @store(out_num, read_uint(data, pos, 1))
+        pos += 1
+    } elif form == 5 {
+        @store(out_num, read_uint(data, pos, 2))
+        pos += 2
+    } elif form == 6 {
+        @store(out_num, read_uint(data, pos, 4))
+        pos += 4
+    } elif form == 7 {
+        @store(out_num, read_uint(data, pos, 8))
+        pos += 8
+    } else {
+        // For line tables we only encounter the forms above.
+        @store(out_num, util.read_uleb(data, pos))
+        pos += util.uleb_len(data, pos)
+    }
+    return pos
+}
+
+fn join_line_path(dir: ref u8, name: ref u8) ref u8 = trust {
+    if name == none {
+        return ""
+    }
+    if @load8(name) == 47 {
+        return name
+    }
+    if dir == none || string.len_raw(dir) == 0 {
+        return name
+    }
+    return @fmtalloc("{s}/{s}", {dir, name})
+}
+
+/// Parse the line table referenced by `stmt_list`.
+fn parse_line_table(info: mut ref DwarfInfo, cu: ref DwarfCu) void = trust {
+    val data: ref u8 = info.line_data
+    if data == none || cu.stmt_list >= info.line_size {
+        return
+    }
+    val pos: mut u64 = cu.stmt_list
+    val len32: u32 = read_uint(data, pos, 4) as u32
+    pos += 4
+    val offset_size: mut u8 = 4
+    val len: mut u64 = len32 as u64
+    if len32 == 0xffffffff {
+        len = read_uint(data, pos, 8)
+        pos += 8
+        offset_size = 8
+    }
+    if len == 0 || pos + len > info.line_size {
+        return
+    }
+    val end: u64 = pos + len
+    val version: u16 = read_uint(data, pos, 2) as u16
+    pos += 2
+    val addr_size: mut u8 = cu.addr_size
+    if version >= 5 {
+        addr_size = @load8(@ptradd(data, pos as i64))
+        pos++
+        pos++ // segment selector size
+    }
+    val header_len: u64 = read_uint(data, pos, offset_size)
+    pos += offset_size as u64
+    val program_start: u64 = pos + header_len
+    val min_inst: u8 = @load8(@ptradd(data, pos as i64))
+    pos++
+    if version >= 4 {
+        pos++ // max ops per instruction
+    }
+    val default_is_stmt: u8 = @load8(@ptradd(data, pos as i64))
+    pos++
+    val line_base: i64 = util.read_s8(data, pos)
+    pos++
+    val line_range: u8 = @load8(@ptradd(data, pos as i64))
+    pos++
+    val opcode_base: u8 = @load8(@ptradd(data, pos as i64))
+    pos++
+    val std_lens: ref u8 = @ptradd(data, pos as i64)
+    pos += (opcode_base - 1) as u64
+
+    val dirs: mut list[ref u8] = @listalloc[allocators.HeapAllocator, ref u8](util.heap())?
+    val files: mut list[ref u8] = @listalloc[allocators.HeapAllocator, ref u8](util.heap())?
+    if version >= 5 {
+        // Directory table.
+        val dir_fmt_count: u8 = @load8(@ptradd(data, pos as i64))
+        pos++
+        val dir_types: mut list[u64] = @listalloc[allocators.HeapAllocator, u64](util.heap())?
+        val dir_forms: mut list[u64] = @listalloc[allocators.HeapAllocator, u64](util.heap())?
+        val di: mut i64 = 0
+        for {
+            if di >= (dir_fmt_count as i64) {
+                break
+            }
+            val ct: u64 = util.read_uleb(data, pos)
+            pos += util.uleb_len(data, pos)
+            val fm: u64 = util.read_uleb(data, pos)
+            pos += util.uleb_len(data, pos)
+            @append(dir_types, ct)
+            @append(dir_forms, fm)
+            di++
+        }
+        val dir_count: u64 = util.read_uleb(data, pos)
+        pos += util.uleb_len(data, pos)
+        val dj: mut i64 = 0
+        for {
+            if dj >= (dir_count as i64) {
+                break
+            }
+            val dir_path: mut ref u8 = ""
+            val k: mut i64 = 0
+            for {
+                if k >= (dir_fmt_count as i64) {
+                    break
+                }
+                val fm_opt = @get(dir_forms, k as usize)
+                val fm: mut u64 = 0
+                if fm_opt is some fv {
+                    fm = fv as u64
+                }
+                val tmp_str: mut ref u8 = ""
+                val tmp_num: mut u64 = 0
+                pos = read_line_form(info, fm, pos, @addr(tmp_str), @addr(tmp_num))
+                if k < @len(dir_types) as i64 {
+                    val ct_opt = @get(dir_types, k as usize)
+                    if ct_opt is some ctv {
+                        if ctv as u64 == 1 {
+                            dir_path = tmp_str
+                        }
+                    }
+                }
+                k++
+            }
+            @append(dirs, dir_path)
+            dj++
+        }
+        // File table.
+        val file_fmt_count: u8 = @load8(@ptradd(data, pos as i64))
+        pos++
+        val file_types: mut list[u64] = @listalloc[allocators.HeapAllocator, u64](util.heap())?
+        val file_forms: mut list[u64] = @listalloc[allocators.HeapAllocator, u64](util.heap())?
+        val fi: mut i64 = 0
+        for {
+            if fi >= (file_fmt_count as i64) {
+                break
+            }
+            val ct: u64 = util.read_uleb(data, pos)
+            pos += util.uleb_len(data, pos)
+            val fm: u64 = util.read_uleb(data, pos)
+            pos += util.uleb_len(data, pos)
+            @append(file_types, ct)
+            @append(file_forms, fm)
+            fi++
+        }
+        val file_count: u64 = util.read_uleb(data, pos)
+        pos += util.uleb_len(data, pos)
+        val fj: mut i64 = 0
+        for {
+            if fj >= (file_count as i64) {
+                break
+            }
+            val file_name: mut ref u8 = ""
+            val dir_idx: mut u64 = 0
+            val k: mut i64 = 0
+            for {
+                if k >= (file_fmt_count as i64) {
+                    break
+                }
+                val fm_opt = @get(file_forms, k as usize)
+                val fm: mut u64 = 0
+                if fm_opt is some fv {
+                    fm = fv as u64
+                }
+                val tmp_str: mut ref u8 = ""
+                val tmp_num: mut u64 = 0
+                pos = read_line_form(info, fm, pos, @addr(tmp_str), @addr(tmp_num))
+                if k < @len(file_types) as i64 {
+                    val ct_opt = @get(file_types, k as usize)
+                    if ct_opt is some ctv {
+                        val ct: u64 = ctv as u64
+                        if ct == 1 {
+                            file_name = tmp_str
+                        } elif ct == 2 {
+                            dir_idx = tmp_num
+                        }
+                    }
+                }
+                k++
+            }
+            val dir: mut ref u8 = ""
+            if dir_idx < (@len(dirs) as u64) {
+                val d_opt = @get(dirs, dir_idx as usize)
+                if d_opt is some dv {
+                    dir = dv as ref u8
+                }
+            }
+            @append(files, join_line_path(dir, file_name))
+            fj++
+        }
+    } else {
+        // DWARF <=4 directory and file tables.
+        for {
+            val p: ref u8 = @ptradd(data, pos as i64)
+            if @load8(p) == 0 {
+                pos++
+                break
+            }
+            @append(dirs, p)
+            pos += (string.len_raw(p) + 1) as u64
+        }
+        for {
+            val p: ref u8 = @ptradd(data, pos as i64)
+            if @load8(p) == 0 {
+                pos++
+                break
+            }
+            val fname: ref u8 = p
+            pos += (string.len_raw(p) + 1) as u64
+            val dir_idx: u64 = util.read_uleb(data, pos)
+            pos += util.uleb_len(data, pos)
+            util.read_uleb(data, pos)
+            pos += util.uleb_len(data, pos)
+            util.read_uleb(data, pos)
+            pos += util.uleb_len(data, pos)
+            val dir: mut ref u8 = ""
+            if dir_idx < (@len(dirs) as u64) {
+                val d_opt = @get(dirs, dir_idx as usize)
+                if d_opt is some dv {
+                    dir = dv as ref u8
+                }
+            }
+            @append(files, join_line_path(dir, fname))
+        }
+    }
+
+    // Make this CU's file table available under indices used by decl_file.
+    if @len(info.files) < @len(files) {
+        info.files = files
+    }
+
+    pos = program_start
+    val address: mut u64 = 0
+    val file: mut u64 = 1
+    val line: mut i64 = 1
+    val column: mut i64 = 0
+    val is_stmt: mut bool = default_is_stmt != 0
+    for {
+        if pos >= end {
+            break
+        }
+        val op: u8 = @load8(@ptradd(data, pos as i64))
+        pos++
+        if op >= opcode_base {
+            val adjusted: i64 = (op - opcode_base) as i64
+            address += ((adjusted / (line_range as i64)) * (min_inst as i64)) as u64
+            line += line_base + (adjusted % (line_range as i64))
+            val row: mut ref DwarfLineRow = allocators.Arena.alloc_or_none(
+                info.arena,
+                @sizeof(DwarfLineRow) as usize
+            ) as ref DwarfLineRow
+            @memset(row, 0, @sizeof(DwarfLineRow) as usize)
+            row.address = address
+            row.file_index = file
+            row.file = line_file(files, file)
+            row.line = line
+            row.column = column
+            row.is_stmt = is_stmt
+            @append(info.lines, row)
+            is_stmt = default_is_stmt != 0
+            column = 0
+        } elif op == 0 {
+            val ext_len: u64 = util.read_uleb(data, pos)
+            pos += util.uleb_len(data, pos)
+            if ext_len == 0 {
+                continue
+            }
+            val sub: u8 = @load8(@ptradd(data, pos as i64))
+            pos++
+            val ext_end: u64 = pos + ext_len - 1
+            if sub == 1 {
+                val row: mut ref DwarfLineRow = allocators.Arena.alloc_or_none(
+                    info.arena,
+                    @sizeof(DwarfLineRow) as usize
+                ) as ref DwarfLineRow
+                @memset(row, 0, @sizeof(DwarfLineRow) as usize)
+                row.address = address
+                row.file_index = file
+                row.file = line_file(files, file)
+                row.line = line
+                row.column = 0
+                row.is_stmt = false
+                @append(info.lines, row)
+                address = 0
+                file = 1
+                line = 1
+                column = 0
+                is_stmt = default_is_stmt != 0
+            } elif sub == 2 {
+                address = read_uint(data, pos, addr_size)
+            }
+            pos = ext_end
+        } elif op == 1 {
+            val row: mut ref DwarfLineRow = allocators.Arena.alloc_or_none(
+                info.arena,
+                @sizeof(DwarfLineRow) as usize
+            ) as ref DwarfLineRow
+            @memset(row, 0, @sizeof(DwarfLineRow) as usize)
+            row.address = address
+            row.file_index = file
+            row.file = line_file(files, file)
+            row.line = line
+            row.column = column
+            row.is_stmt = is_stmt
+            @append(info.lines, row)
+            is_stmt = default_is_stmt != 0
+            column = 0
+        } elif op == 2 {
+            address += util.read_uleb(data, pos)
+            pos += util.uleb_len(data, pos)
+        } elif op == 3 {
+            line += util.read_sleb(data, pos)
+            pos += util.sleb_len(data, pos)
+        } elif op == 4 {
+            file = util.read_uleb(data, pos)
+            pos += util.uleb_len(data, pos)
+        } elif op == 5 {
+            column = util.read_uleb(data, pos) as i64
+            pos += util.uleb_len(data, pos)
+        } elif op == 6 {
+            is_stmt = !is_stmt
+        } elif op == 7 {
+            // basic block
+        } elif op == 8 {
+            val adjusted: i64 = (255 - (opcode_base as i64)) / (line_range as i64)
+            address += (adjusted * (min_inst as i64)) as u64
+        } elif op == 9 {
+            address += read_uint(data, pos, 2)
+            pos += 2
+        } elif op == 10 {
+            // prologue end
+        } elif op == 11 {
+            // epilogue begin
+        } elif op == 12 {
+            util.read_uleb(data, pos)
+            pos += util.uleb_len(data, pos)
+        } else {
+            // Unknown standard opcode: skip its operands.
+            if op > 0 && (op - 1) < (opcode_base - 1) {
+                val count: u8 = @load8(@ptradd(std_lens, (op - 1) as i64))
+                val oi: mut i64 = 0
+                for {
+                    if oi >= (count as i64) {
+                        break
+                    }
+                    util.read_uleb(data, pos)
+                    pos += util.uleb_len(data, pos)
+                    oi++
+                }
+            }
+        }
+    }
+}
+
+fn line_file(files: list[ref u8], index: u64) ref u8 = trust {
+    if index < (@len(files) as u64) {
+        val opt = @get(files, index as usize)
+        if opt is some v {
+            return v as ref u8
+        }
+    }
+    if index > 0 && index - 1 < (@len(files) as u64) {
+        val opt2 = @get(files, (index - 1) as usize)
+        if opt2 is some v2 {
+            return v2 as ref u8
+        }
+    }
+    return ""
+}
+
+fn file_for_index(info: ref DwarfInfo, index: u64) ref u8 = trust {
+    if index < (@len(info.files) as u64) {
+        val opt = @get(info.files, index as usize)
+        if opt is some v {
+            return v as ref u8
+        }
+    }
+    if index > 0 && index - 1 < (@len(info.files) as u64) {
+        val opt2 = @get(info.files, (index - 1) as usize)
+        if opt2 is some v2 {
+            return v2 as ref u8
+        }
+    }
+    return ""
+}
+
+
+fn type_from_die(info: ref DwarfInfo, die: ref DwarfDie, t: mut ref DwarfType) void = trust {
+    t.die = die
+    t.tag = die.tag
+    t.name = attr_str(die, AT_NAME)
+    t.byte_size = attr_s(die, AT_BYTE_SIZE)
+    t.encoding = attr_u(die, AT_ENCODING)
+    t.type_off = attr_type_off(die)
+    if die.tag == TAG_ARRAY_TYPE {
+        for child in die.children {
+            if child.tag == TAG_SUBRANGE_TYPE {
+                val cnt: i64 = attr_s(child, AT_COUNT)
+                if cnt != 0 {
+                    t.count = cnt
+                } else {
+                    val ub: i64 = attr_s(child, AT_UPPER_BOUND)
+                    val lb: i64 = attr_s(child, AT_LOWER_BOUND)
+                    t.count = ub - lb + 1
+                }
+            }
+        }
+    }
+    if die.tag == TAG_STRUCTURE_TYPE || die.tag == TAG_UNION_TYPE || die.tag == TAG_ENUMERATION_TYPE {
+        for child in die.children {
+            if child.tag == TAG_MEMBER || child.tag == TAG_ENUMERATOR {
+                val m: mut ref DwarfMember = allocators.Arena.alloc_or_none(
+                    info.arena,
+                    @sizeof(DwarfMember) as usize
+                ) as ref DwarfMember
+                @memset(m, 0, @sizeof(DwarfMember) as usize)
+                m.name = attr_str(child, AT_NAME)
+                m.type_off = attr_type_off(child)
+                if child.tag == TAG_ENUMERATOR {
+                    m.offset = attr_s(child, AT_CONST_VALUE) as u64
+                } else {
+                    m.offset = attr_s(child, AT_DATA_MEMBER_LOCATION) as u64
+                }
+                @append(t.members, m)
+            }
+        }
+    }
+}
+
+fn build_types(info: mut ref DwarfInfo) void = trust {
+    for die in info.dies {
+        val tag: u64 = die.tag
+        if tag == TAG_BASE_TYPE || tag == TAG_POINTER_TYPE || tag == TAG_CONST_TYPE ||
+        tag == TAG_TYPEDEF || tag == TAG_STRUCTURE_TYPE || tag == TAG_UNION_TYPE ||
+        tag == TAG_ARRAY_TYPE || tag == TAG_ENUMERATION_TYPE {
+            val t: mut ref DwarfType = allocators.Arena.alloc_or_none(
+                info.arena,
+                @sizeof(DwarfType) as usize
+            ) as ref DwarfType
+            @memset(t, 0, @sizeof(DwarfType) as usize)
+            t.offset = die.offset
+            type_from_die(info, die, t)
+            @append(info.types, t)
+        }
+    }
+}
+
+fn build_functions(info: mut ref DwarfInfo) void = trust {
+    for die in info.dies {
+        if die.tag != TAG_SUBPROGRAM && die.tag != TAG_INLINED_SUBROUTINE {
+            continue
+        }
+        val low: u64 = attr_u(die, AT_LOW_PC)
+        if low == 0 {
+            continue
+        }
+        val high_attr: ref DwarfAttr = attr_by_name(die, AT_HIGH_PC)
+        val high: mut u64 = low
+        if high_attr != none {
+            if high_attr.form == 17 || high_attr.form == 18 || high_attr.form == 19 || high_attr.form == 20 {
+                high = high_attr.u
+            } else {
+                high = low + high_attr.u
+            }
+        }
+        val name: ref u8 = attr_str(die, AT_NAME)
+        if string.len_raw(name) == 0 {
+            continue
+        }
+        val f: mut ref DwarfFunction = allocators.Arena.alloc_or_none(
+            info.arena,
+            @sizeof(DwarfFunction) as usize
+        ) as ref DwarfFunction
+        @memset(f, 0, @sizeof(DwarfFunction) as usize)
+        f.name = name
+        f.display = demangle.pretty(name)
+        f.low_pc = low
+        f.high_pc = high
+        f.file = file_for_index(info, attr_u(die, AT_DECL_FILE))
+        f.line = attr_s(die, AT_DECL_LINE)
+        f.die = die
+        val fb: ref DwarfAttr = attr_by_name(die, AT_FRAME_BASE)
+        if fb != none && fb.is_expr {
+            f.frame_off = fb.expr_off
+            f.frame_len = fb.expr_len
+        }
+        f.variables = @listalloc[allocators.HeapAllocator, ref DwarfVariable](util.heap())?
+        for child in die.children {
+            if child.tag == TAG_FORMAL_PARAMETER || child.tag == TAG_VARIABLE {
+                val loc: ref DwarfAttr = attr_by_name(child, AT_LOCATION)
+                val v: mut ref DwarfVariable = allocators.Arena.alloc_or_none(
+                    info.arena,
+                    @sizeof(DwarfVariable) as usize
+                ) as ref DwarfVariable
+                @memset(v, 0, @sizeof(DwarfVariable) as usize)
+                v.name = attr_str(child, AT_NAME)
+                v.source_name = demangle.source_name(v.name)
+                v.type_off = attr_type_off(child)
+                v.file = file_for_index(info, attr_u(child, AT_DECL_FILE))
+                v.line = attr_s(child, AT_DECL_LINE)
+                if loc != none && loc.is_expr {
+                    v.loc_off = loc.expr_off
+                    v.loc_len = loc.expr_len
+                }
+                v.frame_off = f.frame_off
+                v.frame_len = f.frame_len
+                v.die = child
+                @append(f.variables, v)
+                @append(info.variables, v)
+            }
+        }
+        @append(info.functions, f)
+    }
+}
+
+/// Load DWARF information for an ELF file.
+pub fn load(
+    arena: allocators.Arena,
+    e: ref elf.ElfFile
+) result[ref DwarfInfo, ref u8] = trust {
+    val info: mut ref DwarfInfo = allocators.Arena.alloc_or_none(
+        arena,
+        @sizeof(DwarfInfo) as usize
+    ) as ref DwarfInfo
+    if info == none {
+        return err @fmtalloc("out of memory")
+    }
+    @memset(info, 0, @sizeof(DwarfInfo) as usize)
+    info.elf = e
+    info.arena = arena
+    info.info_data = section_ptr(e, ".debug_info")
+    info.info_size = section_size(e, ".debug_info")
+    info.abbrev_data = section_ptr(e, ".debug_abbrev")
+    info.abbrev_size = section_size(e, ".debug_abbrev")
+    info.str_data = section_ptr(e, ".debug_str")
+    info.str_size = section_size(e, ".debug_str")
+    info.line_str_data = section_ptr(e, ".debug_line_str")
+    info.line_str_size = section_size(e, ".debug_line_str")
+    info.addr_data = section_ptr(e, ".debug_addr")
+    info.addr_size = section_size(e, ".debug_addr")
+    info.str_offsets_data = section_ptr(e, ".debug_str_offsets")
+    info.str_offsets_size = section_size(e, ".debug_str_offsets")
+    info.line_data = section_ptr(e, ".debug_line")
+    info.line_size = section_size(e, ".debug_line")
+    if info.info_data == none || info.info_size == 0 || info.abbrev_data == none {
+        return err @fmtalloc("'{s}' has no DWARF debug information (compile with the ALT backend)", {e.path})
+    }
+    info.cus = @listalloc[allocators.HeapAllocator, ref DwarfCu](util.heap())?
+    info.dies = @listalloc[allocators.HeapAllocator, ref DwarfDie](util.heap())?
+    info.functions = @listalloc[allocators.HeapAllocator, ref DwarfFunction](util.heap())?
+    info.variables = @listalloc[allocators.HeapAllocator, ref DwarfVariable](util.heap())?
+    info.types = @listalloc[allocators.HeapAllocator, ref DwarfType](util.heap())?
+    info.lines = @listalloc[allocators.HeapAllocator, ref DwarfLineRow](util.heap())?
+    info.files = @listalloc[allocators.HeapAllocator, ref u8](util.heap())?
+    parse_cus(info)
+    val ci: mut i64 = 0
+    for {
+        if ci >= (@len(info.cus) as i64) {
+            break
+        }
+        val cu_opt = @get(info.cus, ci as usize)
+        if cu_opt is some cu {
+            parse_line_table(info, cu as ref DwarfCu)
+        }
+        ci++
+    }
+    build_types(info)
+    build_functions(info)
+    return ok info
+}
+
+/// Find the function containing `pc`.
+pub fn function_for_pc(info: ref DwarfInfo, pc: u64) ref DwarfFunction = trust {
+    for f in info.functions {
+        if f.high_pc > f.low_pc && pc >= f.low_pc && pc < f.high_pc {
+            return f
+        }
+    }
+    return none
+}
+
+/// Find the line row containing `pc`.
+pub fn line_for_pc(info: ref DwarfInfo, pc: u64) ref DwarfLineRow = trust {
+    val best: mut ref DwarfLineRow = none
+    for row in info.lines {
+        if row.address <= pc {
+            if best == none || row.address >= best.address {
+                best = row
+            }
+        }
+    }
+    return best
+}
+
+/// Find the first statement address for a source line.
+pub fn address_for_line(
+    info: ref DwarfInfo,
+    file: ref u8,
+    line: i64
+) option[u64] = trust {
+    val base4: ref u8 = util.basename(file)
+    for row in info.lines {
+        if row.line != line {
+            continue
+        }
+        if string.len_raw(row.file) == 0 {
+            continue
+        }
+        if string.str_eql(row.file, file) || string.str_eql(util.basename(row.file), base4) {
+            return some row.address
+        }
+    }
+    return none
+}
+
+/// Return the closest earlier line row for a source line, used when asking to
+/// stop on a line with no emitted code.
+pub fn nearest_line_row(info: ref DwarfInfo, file: ref u8, line: i64) ref DwarfLineRow = trust {
+    val base4: ref u8 = util.basename(file)
+    val best: mut ref DwarfLineRow = none
+    for row in info.lines {
+        if string.len_raw(row.file) == 0 {
+            continue
+        }
+        if !string.str_eql(row.file, file) && !string.str_eql(util.basename(row.file), base4) {
+            continue
+        }
+        if row.line <= line {
+            if best == none || row.line > best.line {
+                best = row
+            }
+        }
+    }
+    return best
+}
+
+/// Find a function by raw or demangled name.
+pub fn find_function(info: ref DwarfInfo, query: ref u8) ref DwarfFunction = trust {
+    for f in info.functions {
+        if demangle.matches(f.name, query) {
+            return f
+        }
+    }
+    return none
+}
+
+/// Find a type by raw or source-level name.
+pub fn find_type_by_name(info: ref DwarfInfo, name: ref u8) ref DwarfType = trust {
+    for t in info.types {
+        if t.name != none && (string.str_eql(t.name, name) || string.str_eql(demangle.source_name(t.name), name)) {
+            return t
+        }
+    }
+    return none
+}
+
+/// Return the variable list for a function (including inherited frame vars).
+pub fn function_variables(f: ref DwarfFunction) list[ref DwarfVariable] = trust {
+    if f == none {
+        return @listalloc[allocators.HeapAllocator, ref DwarfVariable](util.heap())?
+    }
+    return f.variables
+}
+
+/// Find a variable in a function by source name.
+pub fn find_variable(f: ref DwarfFunction, name: ref u8) ref DwarfVariable = trust {
+    if f == none {
+        return none
+    }
+    for v in f.variables {
+        if string.str_eql(v.source_name, name) || string.str_eql(v.name, name) {
+            return v
+        }
+    }
+    return none
+}
+

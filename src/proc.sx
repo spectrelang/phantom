@@ -1,0 +1,282 @@
+/// Tiny process/pipe helpers used to drive LLDB and native ptrace sessions.
+///
+/// (C) Navid Momtahen - 2026
+/// SPDX-License-Identifier: GPL-3.0-only
+
+val string     = use("std/string")
+val util       = use("util.sx")
+
+when posix {
+    extern "sys/wait.h"
+    extern "signal.h"
+    extern (C, header) fn pipe(fds: ref i32) i32 = "pipe"
+    extern (C, header) fn fork() i32 = "fork"
+    extern (C, header) fn dup2(oldfd: i32, newfd: i32) i32 = "dup2"
+    extern (C, header) fn close(fd: i32) i32 = "close"
+    extern (C, header) fn execvp(file: ref u8, argv: ref ref u8) i32 = "execvp"
+    extern (C, header) fn _exit(code: i32) void = "_exit"
+    extern (C, header) fn read(fd: i32, buf: ref void, count: usize) i64 = "read"
+    extern (C, header) fn write(fd: i32, buf: ref void, count: usize) i64 = "write"
+    extern (C, header) fn waitpid(pid: i32, status: ref i32, options: i32) i32 = "waitpid"
+    extern (C, header) fn kill(pid: i32, sig: i32) i32 = "kill"
+    extern (C, header) fn getpid() i32 = "getpid"
+}
+
+when windows {
+    extern (C, header) fn GetCurrentProcessId() u32 = "GetCurrentProcessId"
+}
+
+type PipeFds = {
+    rd: i32
+    wr: i32
+}
+
+pub type Child = {
+    pid: mut i32
+    in_fd: mut i32
+    out_fd: mut i32
+    exited: mut bool
+    status: mut i32
+}
+
+/// Return the current process id.
+pub fn pid() i32 = trust {
+    when windows {
+        return GetCurrentProcessId() as i32
+    }
+    return getpid()
+}
+
+/// Spawn `argv[0]` with stdin/stdout/stderr connected to pipes.
+pub fn spawn(argv: list[ref u8]) result[ref Child, ref u8] = trust {
+    if @len(argv) == 0 {
+        return err "empty command"
+    }
+    val in_fds: ref PipeFds = @alloc(@sizeof(PipeFds)) as ref PipeFds
+    val out_fds: ref PipeFds = @alloc(@sizeof(PipeFds)) as ref PipeFds
+    @memset(in_fds, 0, @sizeof(PipeFds) as usize)
+    @memset(out_fds, 0, @sizeof(PipeFds) as usize)
+    if pipe(in_fds as ref i32) != 0 {
+        return err "pipe() failed"
+    }
+    if pipe(out_fds as ref i32) != 0 {
+        close(in_fds.rd)
+        close(in_fds.wr)
+        return err "pipe() failed"
+    }
+    val child_pid: i32 = fork()
+    if child_pid < 0 {
+        close(in_fds.rd)
+        close(in_fds.wr)
+        close(out_fds.rd)
+        close(out_fds.wr)
+        return err "fork() failed"
+    }
+    if child_pid == 0 {
+        dup2(in_fds.rd, 0)
+        dup2(out_fds.wr, 1)
+        dup2(out_fds.wr, 2)
+        close(in_fds.rd)
+        close(in_fds.wr)
+        close(out_fds.rd)
+        close(out_fds.wr)
+        val cmd: mut ref u8 = none
+        val cmd_opt = @get(argv, 0)
+        if cmd_opt is some cv {
+            cmd = cv as ref u8
+        }
+        val argvp: ref ref u8 = @load(argv) as ref ref u8
+        execvp(cmd, argvp)
+        _exit(127)
+    }
+    close(in_fds.rd)
+    close(out_fds.wr)
+    val c: mut ref Child = @alloc(@sizeof(Child)) as ref Child
+    @memset(c, 0, @sizeof(Child) as usize)
+    c.pid = child_pid
+    c.in_fd = in_fds.wr
+    c.out_fd = out_fds.rd
+    return ok c
+}
+
+/// Write all bytes to a file descriptor.
+pub fn write_all(fd: i32, data: ref u8, len: i64) bool = trust {
+    if len <= 0 {
+        return true
+    }
+    val off: mut i64 = 0
+    for {
+        if off >= len {
+            break
+        }
+        val n: i64 = write(fd, @ptradd(data, off), (len - off) as usize)
+        if n <= 0 {
+            return false
+        }
+        off += n
+    }
+    return true
+}
+
+/// Read one byte. Returns 1 on success, 0 on EOF and -1 on error.
+pub fn read_byte(fd: i32, out: ref u8) i32 = trust {
+    return read(fd, out as ref void, 1) as i32
+}
+
+/// Read from `fd` until `marker` appears. The marker is included in the result.
+pub fn read_until(fd: i32, marker: ref u8, cap: i64) ref u8 = trust {
+    val limit: mut i64 = cap
+    if limit <= 0 {
+        limit = 1048576
+    }
+    val buf: ref u8 = @alloc((limit + 1) as usize) as ref u8
+    @memset(buf, 0, (limit + 1) as usize)
+    val mlen: i64 = string.len_raw(marker)
+    val n: mut i64 = 0
+    val found: mut bool = false
+    for {
+        if n >= limit {
+            break
+        }
+        val ch: mut u8 = 0
+        val rc: i32 = read_byte(fd, @addr(ch))
+        if rc <= 0 {
+            break
+        }
+        @store8(@ptradd(buf, n), ch)
+        n++
+        if n >= mlen {
+            val matched: mut bool = true
+            val i: mut i64 = 0
+            for {
+                if i >= mlen {
+                    break
+                }
+                if @load8(@ptradd(buf, n - mlen + i)) != @load8(@ptradd(marker, i)) {
+                    matched = false
+                    break
+                }
+                i++
+            }
+            if matched {
+                found = true
+                break
+            }
+        }
+    }
+    @store8(@ptradd(buf, n), 0)
+    return buf
+}
+
+/// Read one line from `fd` into `buf`.
+pub fn read_line(fd: i32, buf: ref u8, cap: i64) i64 = trust {
+    val n: mut i64 = 0
+    for {
+        if n >= cap - 1 {
+            break
+        }
+        val ch: mut u8 = 0
+        val rc: i32 = read_byte(fd, @addr(ch))
+        if rc <= 0 {
+            break
+        }
+        @store8(@ptradd(buf, n), ch)
+        n++
+        if ch == 10 {
+            break
+        }
+    }
+    @store8(@ptradd(buf, n), 0)
+    return n
+}
+
+/// Close a descriptor if it is valid.
+pub fn close_fd(fd: i32) void = trust {
+    if fd >= 0 {
+        close(fd)
+    }
+}
+
+/// Wait for a child process to change state.
+pub fn wait_child(pid_in: i32) i32 = trust {
+    val status: mut i32 = 0
+    waitpid(pid_in, @addr(status), 0)
+    return status
+}
+
+/// Send a signal to a child process.
+pub fn signal(pid_in: i32, sig: i32) bool = trust {
+    return kill(pid_in, sig) == 0
+}
+
+/// Quit a child, closing its pipes.
+pub fn terminate(c: mut ref Child) void = trust {
+    if c == none {
+        return
+    }
+    if !c.exited {
+        signal(c.pid, 9)
+        wait_child(c.pid)
+        c.exited = true
+    }
+    close_fd(c.in_fd)
+    close_fd(c.out_fd)
+    c.in_fd = -1
+    c.out_fd = -1
+}
+
+/// Find an executable in PATH. Returns none when not found.
+pub fn find_executable(name: ref u8) bool = trust {
+    val path_opt = env_get("PATH")
+    val path: mut ref u8 = none
+    if path_opt is some pv {
+        path = pv as ref u8
+    } else {
+        return false
+    }
+    val n: i64 = string.len_raw(path)
+    val start: mut i64 = 0
+    val i: mut i64 = 0
+    for {
+        if i > n {
+            break
+        }
+        if i == n || @load8(@ptradd(path, i)) == 58 {
+            val dir_len: i64 = i - start
+            if dir_len > 0 {
+                val dir: ref u8 = util.copy_cstr_len(@ptradd(path, start), dir_len)
+                val full: ref u8 = @fmtalloc("{s}/{s}", {dir, name})
+                if file_executable(full) {
+                    return true
+                }
+            }
+            start = i + 1
+        }
+        i++
+    }
+    return false
+}
+
+fn env_get(name: ref u8) option[ref u8] = trust {
+    val p: ref u8 = getenv(name)
+    if p == none {
+        return none
+    }
+    return some p
+}
+
+when posix {
+    extern (C, header) fn getenv(name: ref u8) ref u8 = "getenv"
+    extern (C, header) fn access(path: ref u8, mode: i32) i32 = "access"
+}
+
+when windows {
+    extern (C, header) fn GetFileAttributesA(path: ref u8) u32 = "GetFileAttributesA"
+}
+
+fn file_executable(path: ref u8) bool = trust {
+    when windows {
+        return GetFileAttributesA(path) != 0xFFFFFFFF
+    }
+    return access(path, 1) == 0
+}

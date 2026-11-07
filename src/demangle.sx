@@ -1,0 +1,324 @@
+/// Spectre symbol and source-name demangling.
+///
+/// (C) Navid Momtahen - 2026
+/// SPDX-License-Identifier: GPL-3.0-only
+
+val string = use("std/string")
+val util   = use("util.sx")
+
+pub type Demangled = {
+    raw: mut ref u8
+    module: mut ref u8
+    name: mut ref u8
+    generic: mut ref u8
+    display: mut ref u8
+}
+
+fn strip_prefix(s: ref u8, prefix: ref u8) ref u8 = trust {
+    if string.raw_starts_with(s, prefix) {
+        return @ptradd(s, string.len_raw(prefix))
+    }
+    return s
+}
+
+/// Turn `sx__` / `t_` compiler-internal names back into source names.
+pub fn source_name(sym: ref u8) ref u8 = trust {
+    if sym == none {
+        return ""
+    }
+    val s: mut ref u8 = sym
+    if string.raw_starts_with(s, "sx__") {
+        s = strip_prefix(s, "sx__")
+    }
+    if string.raw_starts_with(s, "t_") {
+        s = strip_prefix(s, "t_")
+    }
+    return s
+}
+
+fn demangle_type_name(t: ref u8) ref u8 = trust {
+    if t == none {
+        return ""
+    }
+    if string.raw_starts_with(t, "ref_") {
+        return @fmtalloc("ref {s}", {demangle_type_name(strip_prefix(t, "ref_"))})
+    }
+    if string.raw_starts_with(t, "mut_") {
+        return @fmtalloc("mut {s}", {demangle_type_name(strip_prefix(t, "mut_"))})
+    }
+    return t
+}
+
+fn generic_args(suffix: ref u8) ref u8 = trust {
+    if suffix == none || string.len_raw(suffix) == 0 {
+        return ""
+    }
+    val out: ref u8 = @alloc((string.len_raw(suffix) * 2 + 16) as usize) as ref u8
+    if out == none {
+        return ""
+    }
+    val oi: mut i64 = 0
+    val start: mut i64 = 0
+    val n: i64 = string.len_raw(suffix)
+    val i: mut i64 = 0
+    for {
+        if i > n {
+            break
+        }
+        val at_end: bool = i == n
+        val sep: bool = !at_end && @load8(@ptradd(suffix, i)) == 95 &&
+        i + 1 < n && @load8(@ptradd(suffix, i + 1)) == 95
+        if at_end || sep {
+            if i > start {
+                if oi > 0 {
+                    @store8(@ptradd(out, oi), 44)
+                    oi++
+                    @store8(@ptradd(out, oi), 32)
+                    oi++
+                }
+                val part: ref u8 = util.copy_cstr_len(@ptradd(suffix, start), i - start)
+                val pretty: ref u8 = demangle_type_name(part)
+                val plen: i64 = string.len_raw(pretty)
+                @memcpy(@ptradd(out, oi), pretty, plen as usize)
+                oi += plen
+            }
+            if at_end {
+                break
+            }
+            i += 2
+            start = i
+        } else {
+            i++
+        }
+    }
+    @store8(@ptradd(out, oi), 0)
+    return out
+}
+
+/// Split a Spectre symbol into module, name, generic arguments and a pretty
+/// display form. Unknown/runtime symbols are returned unchanged.
+pub fn demangle(sym: ref u8) Demangled = trust {
+    val d: mut Demangled = {
+        raw: sym,
+        module: "",
+        name: sym,
+        generic: "",
+        display: sym,
+    }
+    if sym == none {
+        d.raw = ""
+        d.name = ""
+        d.display = ""
+        return d
+    }
+    if string.len_raw(sym) == 0 || @load8(sym) == 95 || @load8(sym) == 46 {
+        return d
+    }
+
+    val s: mut ref u8 = sym
+    if string.raw_starts_with(s, "sx__") {
+        s = strip_prefix(s, "sx__")
+        if string.raw_starts_with(s, "sx__") {
+            s = strip_prefix(s, "sx__")
+        }
+    }
+
+    val base: mut ref u8 = s
+    val gen: mut ref u8 = ""
+    val marker: ref u8 = "__GENMONO"
+    if util.contains(base, marker) {
+        val n: i64 = string.len_raw(base)
+        val m: i64 = string.len_raw(marker)
+        val pos: mut i64 = -1
+        val i: mut i64 = 0
+        for {
+            if i > n - m {
+                break
+            }
+            val matched: mut bool = true
+            val j: mut i64 = 0
+            for {
+                if j >= m {
+                    break
+                }
+                if @load8(@ptradd(base, i + j)) != @load8(@ptradd(marker, j)) {
+                    matched = false
+                    break
+                }
+                j++
+            }
+            if matched {
+                pos = i
+                break
+            }
+            i++
+        }
+        if pos >= 0 {
+            gen = @ptradd(base, pos + m)
+            if string.raw_starts_with(gen, "__") {
+                gen = strip_prefix(gen, "__")
+            }
+            base = util.copy_cstr_len(base, pos)
+        }
+    }
+
+    if string.len_raw(base) == 0 {
+        d.module = ""
+        d.name = base
+        d.generic = generic_args(gen)
+        d.display = base
+        return d
+    }
+
+    val last_sep: mut i64 = -1
+    val bn: i64 = string.len_raw(base)
+    val bi: mut i64 = 0
+    for {
+        if bi + 1 >= bn {
+            break
+        }
+        if @load8(@ptradd(base, bi)) == 95 && @load8(@ptradd(base, bi + 1)) == 95 {
+            last_sep = bi
+            bi += 2
+        } else {
+            bi++
+        }
+    }
+
+    if last_sep < 0 {
+        d.module = ""
+        d.name = base
+    } else {
+        d.module = util.copy_cstr_len(base, last_sep)
+        d.name = @ptradd(base, last_sep + 2)
+    }
+
+    // Convert remaining double underscores in the module prefix to "::" for
+    // display purposes.
+    if string.len_raw(d.module) > 0 {
+        val slen: i64 = string.len_raw(d.module)
+        val pretty_mod: ref u8 = @alloc((slen + 1) as usize) as ref u8
+        val oi: mut i64 = 0
+        val si: mut i64 = 0
+        for {
+            if si >= slen {
+                break
+            }
+            if si + 1 < slen && @load8(@ptradd(d.module, si)) == 95 &&
+            @load8(@ptradd(d.module, si + 1)) == 95 {
+                @store8(@ptradd(pretty_mod, oi), 58)
+                @store8(@ptradd(pretty_mod, oi + 1), 58)
+                oi += 2
+                si += 2
+            } else {
+                @store8(@ptradd(pretty_mod, oi), @load8(@ptradd(d.module, si)))
+                oi++
+                si++
+            }
+        }
+        @store8(@ptradd(pretty_mod, oi), 0)
+        d.module = pretty_mod
+    }
+
+    d.generic = generic_args(gen)
+    if string.len_raw(d.module) > 0 {
+        if string.len_raw(d.generic) > 0 {
+            d.display = @fmtalloc("{s}::{s}<{s}>", {d.module, d.name, d.generic})
+        } else {
+            d.display = @fmtalloc("{s}::{s}", {d.module, d.name})
+        }
+    } else {
+        if string.len_raw(d.generic) > 0 {
+            d.display = @fmtalloc("{s}<{s}>", {d.name, d.generic})
+        } else {
+            d.display = d.name
+        }
+    }
+    return d
+}
+
+/// Return a pretty display name for a raw symbol.
+pub fn pretty(sym: ref u8) ref u8 = trust {
+    val d: Demangled = demangle(sym)
+    return d.display
+}
+
+/// Return the final source-level component of a symbol.
+pub fn short_name(sym: ref u8) ref u8 = trust {
+    val d: Demangled = demangle(sym)
+    return d.name
+}
+
+/// True when a raw symbol or its demangled form matches `query`.
+pub fn matches(sym: ref u8, query: ref u8) bool = trust {
+    if sym == none || query == none {
+        return false
+    }
+    if string.str_eql(sym, query) {
+        return true
+    }
+    val d: Demangled = demangle(sym)
+    if string.str_eql(d.display, query) || string.str_eql(d.name, query) {
+        return true
+    }
+    if string.str_eql(source_name(sym), query) {
+        return true
+    }
+    // Accept "module::name", "module.name", "module/name" spellings.
+    val n: i64 = string.len_raw(query)
+    val norm: ref u8 = @alloc((n + 1) as usize) as ref u8
+    val i: mut i64 = 0
+    for {
+        if i >= n {
+            break
+        }
+        val c: u8 = @load8(@ptradd(query, i))
+        if c == 46 || c == 47 || c == 58 {
+            @store8(@ptradd(norm, i), 58)
+            if c == 58 && i + 1 < n && @load8(@ptradd(query, i + 1)) == 58 {
+                i++
+            }
+        } else {
+            @store8(@ptradd(norm, i), c)
+        }
+        i++
+    }
+    @store8(@ptradd(norm, i), 0)
+    if string.str_eql(d.display, norm) {
+        return true
+    }
+    // Match a trailing component: e.g. "stdio.print" against
+    // "std::stdio::print".
+    val suffix: mut ref u8 = query
+    for {
+        if string.len_raw(suffix) == 0 {
+            break
+        }
+        if string.str_eql(d.display, suffix) || string.str_eql(d.name, suffix) {
+            return true
+        }
+        val c: u8 = @load8(suffix)
+        if c == 58 || c == 46 || c == 47 {
+            suffix = @ptradd(suffix, 1)
+        } else {
+            // Advance to the next separator.
+            val sn: i64 = string.len_raw(suffix)
+            val si: mut i64 = 0
+            for {
+                if si >= sn {
+                    break
+                }
+                val sc: u8 = @load8(@ptradd(suffix, si))
+                if sc == 58 || sc == 46 || sc == 47 {
+                    break
+                }
+                si++
+            }
+            if si >= sn {
+                break
+            }
+            suffix = @ptradd(suffix, si + 1)
+        }
+    }
+    return false
+}

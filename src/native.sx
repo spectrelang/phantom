@@ -1,0 +1,1389 @@
+/// Native Linux/x86_64 debugging backend: ELF/DWARF inspection plus simple
+/// ptrace breakpoints and variable reads.
+///
+/// (C) Navid Momtahen - 2026
+/// SPDX-License-Identifier: GPL-3.0-only
+
+val string     = use("std/string")
+val allocators = use("std/allocators")
+val util       = use("util.sx")
+val elf        = use("elf.sx")
+val dwarf      = use("dwarf.sx")
+val demangle   = use("demangle.sx")
+
+when linux {
+    extern "sys/ptrace.h"
+    extern "sys/wait.h"
+    extern "signal.h"
+    extern (C, header) fn fork() i32 = "fork"
+    extern (C, header) fn dup2(oldfd: i32, newfd: i32) i32 = "dup2"
+    extern (C, header) fn execvp(file: ref u8, argv: ref ref u8) i32 = "execvp"
+    extern (C, header) fn _exit(code: i32) void = "_exit"
+    extern (C, header) fn ptrace(request: i64, pid: i32, addr: ref void, data: ref void) i64 = "ptrace"
+    extern (C, header) fn waitpid(pid: i32, status: ref i32, options: i32) i32 = "waitpid"
+    extern (C, header) fn kill(pid: i32, sig: i32) i32 = "kill"
+    extern (C, header) fn open(path: ref u8, flags: i32) i32 = "open"
+    extern (C, header) fn pread(fd: i32, buf: ref void, count: usize, offset: i64) i64 = "pread"
+    extern (C, header) fn pwrite(fd: i32, buf: ref void, count: usize, offset: i64) i64 = "pwrite"
+    extern (C, header) fn close(fd: i32) i32 = "close"
+    extern (C) fn __errno_location() ref i32 = "__errno_location"
+}
+
+val PTRACE_TRACEME: i64 = 0
+val PTRACE_PEEKTEXT: i64 = 1
+val PTRACE_PEEKDATA: i64 = 2
+val PTRACE_POKETEXT: i64 = 4
+val PTRACE_POKEDATA: i64 = 5
+val PTRACE_CONT: i64 = 7
+val PTRACE_KILL: i64 = 8
+val PTRACE_SINGLESTEP: i64 = 9
+val PTRACE_GETREGS: i64 = 12
+val PTRACE_SETREGS: i64 = 13
+val PTRACE_ATTACH: i64 = 16
+val PTRACE_DETACH: i64 = 17
+
+pub type UserRegs = {
+    r15: mut u64
+    r14: mut u64
+    r13: mut u64
+    r12: mut u64
+    rbp: mut u64
+    rbx: mut u64
+    r11: mut u64
+    r10: mut u64
+    r9: mut u64
+    r8: mut u64
+    rax: mut u64
+    rcx: mut u64
+    rdx: mut u64
+    rsi: mut u64
+    rdi: mut u64
+    orig_rax: mut u64
+    rip: mut u64
+    cs: mut u64
+    eflags: mut u64
+    rsp: mut u64
+    ss: mut u64
+    fs_base: mut u64
+    gs_base: mut u64
+    ds: mut u64
+    es: mut u64
+    fs: mut u64
+    gs: mut u64
+}
+
+pub type NativeBreakpoint = {
+    id: mut i64
+    address: mut u64
+    orig_byte: mut u8
+    applied: mut bool
+    enabled: mut bool
+    label: mut ref u8
+    kind: mut ref u8
+}
+
+pub type EvalResult = {
+    success: mut bool
+    value: mut u64
+    is_value: mut bool
+}
+
+pub type NativeSession = {
+    arena: mut allocators.Arena
+    elf_file: mut ref elf.ElfFile
+    dwarf_info: mut ref dwarf.DwarfInfo
+    pid: mut i32
+    started: mut bool
+    stopped: mut bool
+    exited: mut bool
+    exit_code: mut i64
+    bias: mut u64
+    breakpoints: mut list[ref NativeBreakpoint]
+    next_bp_id: mut i64
+    last_hit: mut ref NativeBreakpoint
+    regs: mut UserRegs
+    current_function: mut ref dwarf.DwarfFunction
+    mem_fd: mut i32
+    argv: mut list[ref u8]
+    redirect_stdout: mut bool
+}
+
+fn argv_new() list[ref u8] = trust {
+    return @listalloc[allocators.HeapAllocator, ref u8](util.heap())?
+}
+
+fn bp_new() list[ref NativeBreakpoint] = trust {
+    return @listalloc[allocators.HeapAllocator, ref NativeBreakpoint](util.heap())?
+}
+
+fn errno() i64 = trust {
+    when linux {
+        val p: ref i32 = __errno_location()
+        if p == none {
+            return 0
+        }
+        return @load(p) as i64
+    }
+    return 0
+}
+
+fn read_mem_fd(s: ref NativeSession, addr: u64, buf: ref u8, len: i64) bool = trust {
+    if s.mem_fd < 0 || len <= 0 {
+        return false
+    }
+    val n: i64 = pread(s.mem_fd, buf as ref void, len as usize, addr as i64)
+    return n == len
+}
+
+pub fn mem_read_u64(s: ref NativeSession, addr: u64) u64 = trust {
+    val buf: mut [8]u8 = @zeroed
+    if !read_mem_fd(s, addr, @addr(buf) as ref u8, 8) {
+        return 0
+    }
+    return util.read_u64(@addr(buf) as ref u8, 0)
+}
+
+pub fn mem_read_u32(s: ref NativeSession, addr: u64) u32 = trust {
+    val buf: mut [4]u8 = @zeroed
+    if !read_mem_fd(s, addr, @addr(buf) as ref u8, 4) {
+        return 0
+    }
+    return util.read_u32(@addr(buf) as ref u8, 0)
+}
+
+pub fn mem_read_u16(s: ref NativeSession, addr: u64) u16 = trust {
+    val buf: mut [2]u8 = @zeroed
+    if !read_mem_fd(s, addr, @addr(buf) as ref u8, 2) {
+        return 0
+    }
+    return util.read_u16(@addr(buf) as ref u8, 0)
+}
+
+pub fn mem_read_u8(s: ref NativeSession, addr: u64) u8 = trust {
+    val buf: mut [1]u8 = @zeroed
+    if !read_mem_fd(s, addr, @addr(buf) as ref u8, 1) {
+        return 0
+    }
+    return @load8(@addr(buf))
+}
+
+fn get_regs(s: ref NativeSession) bool = trust {
+    if s.pid <= 0 {
+        return false
+    }
+    val rc: i64 = ptrace(PTRACE_GETREGS, s.pid, none, @addr(s.regs) as ref void)
+    return rc == 0
+}
+
+fn set_regs(s: ref NativeSession) bool = trust {
+    if s.pid <= 0 {
+        return false
+    }
+    val rc: i64 = ptrace(PTRACE_SETREGS, s.pid, none, @addr(s.regs) as ref void)
+    return rc == 0
+}
+
+fn peek_byte(s: ref NativeSession, addr: u64) u8 = trust {
+    if s.mem_fd >= 0 {
+        val buf: mut [1]u8 = @zeroed
+        val n: i64 = pread(s.mem_fd, @addr(buf) as ref void, 1, addr as i64)
+        if n == 1 {
+            return @load8(@addr(buf))
+        }
+    }
+    val data: ref void = none
+    val rc: i64 = ptrace(PTRACE_PEEKTEXT, s.pid, @bitcast(addr, ref void), data)
+    if rc < 0 {
+        return 0
+    }
+    return (rc & 255) as u8
+}
+
+fn poke_byte(s: ref NativeSession, addr: u64, value: u8) bool = trust {
+    if s.mem_fd >= 0 {
+        val buf: mut [1]u8 = @zeroed
+        @store8(@addr(buf), value)
+        val n: i64 = pwrite(s.mem_fd, @addr(buf) as ref void, 1, addr as i64)
+        return n == 1
+    }
+    val word: i64 = ptrace(PTRACE_PEEKTEXT, s.pid, @bitcast(addr, ref void), none)
+    if word < 0 {
+        return false
+    }
+    val new_word: i64 = (word & (~255)) | (value as i64)
+    val rc: i64 = ptrace(
+        PTRACE_POKETEXT,
+        s.pid,
+        @bitcast(addr, ref void),
+        @bitcast(new_word, ref void)
+    )
+    return rc == 0
+}
+
+fn apply_breakpoint(s: ref NativeSession, bp: mut ref NativeBreakpoint) bool = trust {
+    if bp == none || bp.applied || !bp.enabled {
+        return true
+    }
+    val runtime_addr: u64 = bp.address + s.bias
+    val orig: u8 = peek_byte(s, runtime_addr)
+    if orig == 0xcc {
+        return true
+    }
+    bp.orig_byte = orig
+    if !poke_byte(s, runtime_addr, 0xcc) {
+        return false
+    }
+    bp.applied = true
+    return true
+}
+
+fn remove_breakpoint(s: ref NativeSession, bp: mut ref NativeBreakpoint) bool = trust {
+    if bp == none || !bp.applied {
+        return true
+    }
+    val runtime_addr: u64 = bp.address + s.bias
+    if !poke_byte(s, runtime_addr, bp.orig_byte) {
+        return false
+    }
+    bp.applied = false
+    return true
+}
+
+fn reinsert_all(s: ref NativeSession) void = trust {
+    val n: i64 = @len(s.breakpoints) as i64
+    val i: mut i64 = 0
+    for {
+        if i >= n {
+            break
+        }
+        val opt = @get(s.breakpoints, i as usize)
+        if opt is some raw_bp {
+            val bp: mut ref NativeBreakpoint = raw_bp as ref NativeBreakpoint
+            if bp.enabled {
+                apply_breakpoint(s, bp)
+            }
+        }
+        i++
+    }
+}
+
+/// Load a target without starting it.
+pub fn load(
+    arena: allocators.Arena,
+    program: ref u8
+) result[ref NativeSession, ref u8] = trust {
+    val e_opt = elf.load(arena, program)
+    val e: mut ref elf.ElfFile = none
+    match e_opt {
+        err er => {
+            return err er
+        }
+        ok ev => {
+            e = ev
+        }
+    }
+    val d_opt = dwarf.load(arena, e)
+    val d: mut ref dwarf.DwarfInfo = none
+    match d_opt {
+        err der => {
+            return err der
+        }
+        ok dv => {
+            d = dv
+        }
+    }
+    val s: mut ref NativeSession = @alloc(@sizeof(NativeSession)) as ref NativeSession
+    @memset(s, 0, @sizeof(NativeSession) as usize)
+    s.arena = arena
+    s.elf_file = e
+    s.dwarf_info = d
+    s.pid = 0
+    s.started = false
+    s.stopped = false
+    s.exited = false
+    s.exit_code = 0
+    s.bias = 0
+    s.breakpoints = bp_new()
+    s.next_bp_id = 1
+    s.last_hit = none
+    s.current_function = none
+    s.mem_fd = -1
+    s.argv = argv_new()
+    s.redirect_stdout = false
+    return ok s
+}
+
+/// Start the target under ptrace.
+pub fn launch(s: mut ref NativeSession, args: list[ref u8]) result[void, ref u8] = trust {
+    if s == none {
+        return err "no native session"
+    }
+    if s.started {
+        return err "process is already running"
+    }
+    val argv: mut list[ref u8] = argv_new()
+    // The caller passes only target arguments. Recover the program name from
+    // the ELF path, which is stable and has no embedded NUL issues.
+    @append(argv, s.elf_file.path)
+    for a in args {
+        @append(argv, a)
+    }
+    val nullp: ref u8 = none
+    @append(argv, nullp)
+    s.argv = argv
+
+    val child_pid: i32 = fork()
+    if child_pid < 0 {
+        return err @fmtalloc("fork() failed (errno {lld})", {errno()})
+    }
+    if child_pid == 0 {
+        if s.redirect_stdout {
+            dup2(2, 1)
+        }
+        val rc: i64 = ptrace(
+            PTRACE_TRACEME,
+            0,
+            none,
+            none
+        )
+        if rc < 0 {
+            _exit(126)
+        }
+        val cmd: mut ref u8 = none
+        val cmd_opt = @get(argv, 0)
+        if cmd_opt is some cv {
+            cmd = cv as ref u8
+        }
+        val argvp: ref ref u8 = @load(argv) as ref ref u8
+        execvp(cmd, argvp)
+        _exit(127)
+    }
+
+    s.pid = child_pid
+    val status: mut i32 = 0
+    val w: i32 = waitpid(child_pid, @addr(status), 0)
+    if w < 0 {
+        return err @fmtalloc("waitpid() failed (errno {lld})", {errno()})
+    }
+    if !w_stopped(status) {
+        return err @fmtalloc("target did not stop at startup")
+    }
+    s.started = true
+    s.stopped = true
+    s.exited = false
+    val mem_path: ref u8 = @fmtalloc("/proc/{d}/mem", {child_pid})
+    s.mem_fd = open(mem_path, 2)
+    if s.mem_fd < 0 {
+        return err @fmtalloc("cannot open {s}", {mem_path})
+    }
+    when linux {
+        val maps_path: ref u8 = @fmtalloc("/proc/{d}/maps", {child_pid})
+        s.bias = elf.runtime_bias(s.elf_file, maps_path)
+    }
+    get_regs(s)
+    val bpn: i64 = @len(s.breakpoints) as i64
+    val bpi: mut i64 = 0
+    for {
+        if bpi >= bpn {
+            break
+        }
+        val bopt = @get(s.breakpoints, bpi as usize)
+        if bopt is some raw_bp {
+            val bp: mut ref NativeBreakpoint = raw_bp as ref NativeBreakpoint
+            if bp.enabled {
+                apply_breakpoint(s, bp)
+            }
+        }
+        bpi++
+    }
+    return ok ()
+}
+
+fn w_stopped(status: i32) bool = trust {
+    return (status & 255) == 127
+}
+
+fn w_signaled(status: i32) bool = trust {
+    return (status & 127) != 0 && (status & 255) != 127
+}
+
+fn w_exited(status: i32) bool = trust {
+    return (status & 127) == 0
+}
+
+fn w_stop_signal(status: i32) i64 = trust {
+    return ((status >> 8) & 255) as i64
+}
+
+fn w_exit_status(status: i32) i64 = trust {
+    return ((status >> 8) & 255) as i64
+}
+
+fn find_bp_at(s: ref NativeSession, addr: u64) ref NativeBreakpoint = trust {
+    for bp in s.breakpoints {
+        if bp.address + s.bias == addr {
+            return bp
+        }
+    }
+    return none
+}
+
+fn install_current_function(s: mut ref NativeSession) void = trust {
+    if s.dwarf_info == none {
+        s.current_function = none
+        return
+    }
+    val pc: u64 = s.regs.rip
+    val link_pc: u64 = pc - s.bias
+    s.current_function = dwarf.function_for_pc(s.dwarf_info, link_pc)
+}
+
+/// Wait for the next stop and return true while the process is alive.
+pub fn wait_for_stop(s: mut ref NativeSession) bool = trust {
+    if s == none || !s.started || s.exited {
+        return false
+    }
+    val status: mut i32 = 0
+    val w: i32 = waitpid(s.pid, @addr(status), 0)
+    if w < 0 {
+        s.exited = true
+        s.exit_code = -1
+        return false
+    }
+    if w_exited(status) {
+        s.exited = true
+        s.stopped = false
+        s.exit_code = w_exit_status(status)
+        return false
+    }
+    if w_signaled(status) {
+        s.exited = true
+        s.stopped = false
+        s.exit_code = 128 + w_stop_signal(status)
+        return false
+    }
+    if !w_stopped(status) {
+        return !s.exited
+    }
+    s.stopped = true
+    s.exited = false
+    val sig: i64 = w_stop_signal(status)
+    get_regs(s)
+    if sig == 5 {
+        val hit_pc: u64 = s.regs.rip - 1
+        val bp: mut ref NativeBreakpoint = find_bp_at(s, hit_pc)
+        if bp != none {
+            // Restore the original instruction and rewind RIP so the user sees
+            // the breakpoint location.
+            val runtime_addr: u64 = bp.address + s.bias
+            poke_byte(s, runtime_addr, bp.orig_byte)
+            bp.applied = false
+            s.regs.rip = hit_pc
+            set_regs(s)
+            s.last_hit = bp
+        } else {
+            s.last_hit = none
+        }
+    } else {
+        s.last_hit = none
+    }
+    install_current_function(s)
+    return true
+}
+
+/// Continue the target until a breakpoint, signal, or exit.
+pub fn cont(s: mut ref NativeSession) result[void, ref u8] = trust {
+    if s == none || !s.started {
+        return err "process has not been started"
+    }
+    if s.exited {
+        return err "process has exited"
+    }
+    // If we stopped on a breakpoint, step over the restored instruction and
+    // reinstall the breakpoint before continuing.
+    if s.last_hit != none {
+        val bp: mut ref NativeBreakpoint = s.last_hit
+        val step_rc: i64 = ptrace(PTRACE_SINGLESTEP, s.pid, none, none)
+        if step_rc == 0 {
+            val status: mut i32 = 0
+            waitpid(s.pid, @addr(status), 0)
+        }
+        apply_breakpoint(s, bp)
+        s.last_hit = none
+    }
+    reinsert_all(s)
+    val rc: i64 = ptrace(PTRACE_CONT, s.pid, none, none)
+    if rc != 0 {
+        return err @fmtalloc("ptrace(PTRACE_CONT) failed (errno {lld})", {errno()})
+    }
+    if !wait_for_stop(s) {
+        return ok ()
+    }
+    return ok ()
+}
+
+/// Add a breakpoint at a link-time address. Returns its id.
+pub fn add_breakpoint(
+    s: mut ref NativeSession,
+    address: u64,
+    label: ref u8,
+    kind: ref u8
+) i64 = trust {
+    val bp: mut ref NativeBreakpoint = @alloc(@sizeof(NativeBreakpoint)) as ref NativeBreakpoint
+    @memset(bp, 0, @sizeof(NativeBreakpoint) as usize)
+    bp.id = s.next_bp_id
+    s.next_bp_id = s.next_bp_id + 1
+    bp.address = address
+    bp.orig_byte = 0
+    bp.applied = false
+    bp.enabled = true
+    bp.label = label
+    bp.kind = kind
+    @append(s.breakpoints, bp)
+    if s.started && s.stopped {
+        apply_breakpoint(s, bp)
+    }
+    return bp.id
+}
+
+/// Remove a breakpoint by id.
+pub fn delete_breakpoint(s: mut ref NativeSession, id: i64) bool = trust {
+    if s == none {
+        return false
+    }
+    val n: i64 = @len(s.breakpoints) as i64
+    val i: mut i64 = 0
+    for {
+        if i >= n {
+            break
+        }
+        val opt = @get(s.breakpoints, i as usize)
+        if opt is some raw_bp {
+            val bp: mut ref NativeBreakpoint = raw_bp as ref NativeBreakpoint
+            if bp.id == id {
+                remove_breakpoint(s, bp)
+                @remove(s.breakpoints, i as usize)
+                return true
+            }
+        }
+        i++
+    }
+    return false
+}
+
+/// List breakpoints as a human-readable string.
+pub fn list_breakpoints(s: ref NativeSession) ref u8 = trust {
+    val sb: ref void = string.StringBuilder.new()
+    for bp in s.breakpoints {
+        val suffix: mut ref u8 = ""
+        if !bp.enabled {
+            suffix = " (disabled)"
+        }
+        string.StringBuilder.append_cstr(sb, @fmtalloc("Breakpoint {lld}: {s} at 0x{x}{s}\n", {
+            bp.id, bp.kind, bp.address + s.bias, suffix
+        }))
+    }
+    val built: string.String = string.StringBuilder.build(sb)
+    val out: ref u8 = util.copy_cstr(string.cstr(built))
+    string.StringBuilder.free(sb)
+    return out
+}
+
+/// Resolve a user spec (function name or file:line) to a link-time address.
+pub fn resolve_breakpoint(s: NativeSession, query: ref u8) option[u64] = trust {
+    val colon: i64 = last_colon(query)
+    if colon > 0 {
+        val file: ref u8 = util.copy_cstr_len(query, colon)
+        val line_opt = util.parse_i64(@ptradd(query, colon + 1))
+        if line_opt is some line {
+            val addr_opt = dwarf.address_for_line(s.dwarf_info, file, line)
+            if addr_opt is some addr {
+                return some addr
+            }
+            val row: ref dwarf.DwarfLineRow = dwarf.nearest_line_row(s.dwarf_info, file, line)
+            if row != none {
+                return some row.address
+            }
+            return none
+        }
+    }
+    val f: ref dwarf.DwarfFunction = dwarf.find_function(s.dwarf_info, query)
+    if f != none {
+        // Stop after the prologue so frame-relative locals are valid.
+        for row in s.dwarf_info.lines {
+            if row.address > f.low_pc && row.address < f.high_pc && row.is_stmt {
+                return some row.address
+            }
+        }
+        return some f.low_pc
+    }
+    // Fall back to a demangled ELF symbol match.
+    for sym in s.elf_file.symbols {
+        if elf.symbol_is_code(sym) && demangle.matches(sym.name, query) {
+            return some sym.value
+        }
+    }
+    return none
+}
+
+fn last_colon(query: ref u8) i64 = trust {
+    val n: i64 = string.len_raw(query)
+    val i: mut i64 = n - 1
+    for {
+        if i < 0 {
+            break
+        }
+        if @load8(@ptradd(query, i)) == 58 {
+            return i
+        }
+        i--
+    }
+    return -1
+}
+
+/// Return a display name for a DWARF type offset.
+pub fn type_name(s: ref NativeSession, off: u64) ref u8 = trust {
+    if s == none || s.dwarf_info == none {
+        return "?"
+    }
+    return type_display(s.dwarf_info, off)
+}
+
+/// Read the current function's variables and return formatted `name = value`
+/// rows.
+pub fn locals(s: ref NativeSession) ref u8 = trust {
+    if s == none || !s.stopped || s.current_function == none {
+        return ""
+    }
+    val sb: ref void = string.StringBuilder.new()
+    for v in s.current_function.variables {
+        val val_str: ref u8 = render_variable(s, v)
+        string.StringBuilder.append_cstr(sb, @fmtalloc("({s}) {s} = {s}\n", {
+            type_display(s.dwarf_info, v.type_off), v.source_name, val_str
+        }))
+    }
+    val built: string.String = string.StringBuilder.build(sb)
+    val out: ref u8 = util.copy_cstr(string.cstr(built))
+    string.StringBuilder.free(sb)
+    return out
+}
+
+/// Read one variable by source name or raw name.
+pub fn read_variable(s: ref NativeSession, name: ref u8) ref u8 = trust {
+    if s == none || !s.stopped || s.current_function == none {
+        return ""
+    }
+    val v: ref dwarf.DwarfVariable = dwarf.find_variable(s.current_function, name)
+    if v == none {
+        return ""
+    }
+    return render_variable(s, v)
+}
+
+
+fn render_variable(s: ref NativeSession, v: ref dwarf.DwarfVariable) ref u8 = trust {
+    if v.loc_len == 0 {
+        return "<optimized out>"
+    }
+    val er: EvalResult = eval_expr(s, v.loc_off, v.loc_len)
+    if !er.success {
+        return "<unavailable>"
+    }
+    if er.is_value {
+        return format_scalar(s.dwarf_info, v.type_off, er.value)
+    }
+    return render_value(s, v.type_off, er.value, 0)
+}
+
+fn type_at(info: ref dwarf.DwarfInfo, off: u64) ref dwarf.DwarfType = trust {
+    for t in info.types {
+        if t.offset == off {
+            return t
+        }
+    }
+    return none
+}
+
+fn unwrap_type(info: ref dwarf.DwarfInfo, off_in: u64) ref dwarf.DwarfType = trust {
+    val t: ref dwarf.DwarfType = type_at(info, off_in)
+    if t == none {
+        return none
+    }
+    if t.tag == 38 || t.tag == 22 {
+        return unwrap_type(info, t.type_off)
+    }
+    return t
+}
+
+fn type_display(info: ref dwarf.DwarfInfo, off: u64) ref u8 = trust {
+    val t: ref dwarf.DwarfType = type_at(info, off)
+    if t == none {
+        return "?"
+    }
+    if t.name != none && string.len_raw(t.name) > 0 {
+        return demangle.source_name(t.name)
+    }
+    if t.tag == 15 {
+        return @fmtalloc("{s} *", {type_display(info, t.type_off)})
+    }
+    if t.tag == 1 {
+        return @fmtalloc("{s}[{lld}]", {type_display(info, t.type_off), t.count})
+    }
+    return "?"
+}
+
+fn type_size(info: ref dwarf.DwarfInfo, off: u64) i64 = trust {
+    val t: ref dwarf.DwarfType = unwrap_type(info, off)
+    if t == none {
+        return 8
+    }
+    if t.byte_size > 0 {
+        return t.byte_size
+    }
+    if t.tag == 15 {
+        return 8
+    }
+    if t.tag == 1 {
+        val inner: i64 = type_size(info, t.type_off)
+        if t.count > 0 {
+            return inner * t.count
+        }
+        return inner
+    }
+    if t.tag == 19 || t.tag == 23 {
+        return 8
+    }
+    return 8
+}
+
+fn format_scalar(info: ref dwarf.DwarfInfo, off: u64, value: u64) ref u8 = trust {
+    val t: ref dwarf.DwarfType = unwrap_type(info, off)
+    if t == none {
+        return @fmtalloc("0x{x}", {value})
+    }
+    if t.tag == 15 {
+        return @fmtalloc("0x{x}", {value})
+    }
+    if t.tag == 36 {
+        val sz: i64 = t.byte_size
+        val enc: u64 = t.encoding
+        if sz == 8 {
+            if enc == 5 {
+                return @fmtalloc("{lld}", {value as i64})
+            }
+            return @fmtalloc("{lld}", {value})
+        }
+        if sz == 4 {
+            if enc == 5 {
+                return @fmtalloc("{d}", {value as i32 as i64})
+            }
+            return @fmtalloc("{d}", {value as u32 as i64})
+        }
+        if sz == 2 {
+            if enc == 5 {
+                return @fmtalloc("{d}", {value as i16 as i64})
+            }
+            return @fmtalloc("{d}", {value as u16 as i64})
+        }
+        if sz == 1 {
+            if enc == 5 || enc == 8 {
+                return @fmtalloc("{d}", {value as u8 as i64})
+            }
+            return @fmtalloc("{d}", {value as u8 as i64})
+        }
+    }
+    return @fmtalloc("0x{x}", {value})
+}
+
+fn render_value(s: ref NativeSession, off: u64, addr: u64, depth: i64) ref u8 = trust {
+    if depth > 3 {
+        return "..."
+    }
+    val info: ref dwarf.DwarfInfo = s.dwarf_info
+    val t: ref dwarf.DwarfType = unwrap_type(info, off)
+    if t == none {
+        return @fmtalloc("0x{x}", {mem_read_u64(s, addr)})
+    }
+    if t.tag == 15 {
+        return @fmtalloc("0x{x}", {mem_read_u64(s, addr)})
+    }
+    if t.tag == 1 {
+        val count: i64 = t.count
+        val inner_sz: i64 = type_size(info, t.type_off)
+        val sb: ref void = string.StringBuilder.new()
+        string.StringBuilder.append_cstr(sb, "[")
+        val i: mut i64 = 0
+        for {
+            if i >= count || i >= 16 {
+                break
+            }
+            if i > 0 {
+                string.StringBuilder.append_cstr(sb, ", ")
+            }
+            val elem_addr: u64 = addr + (i * inner_sz) as u64
+            string.StringBuilder.append_cstr(sb, render_value(s, t.type_off, elem_addr, depth + 1))
+            i++
+        }
+        if count > 16 {
+            string.StringBuilder.append_cstr(sb, ", ...")
+        }
+        string.StringBuilder.append_cstr(sb, "]")
+        val built: string.String = string.StringBuilder.build(sb)
+        val out: ref u8 = util.copy_cstr(string.cstr(built))
+        string.StringBuilder.free(sb)
+        return out
+    }
+    if t.tag == 19 || t.tag == 23 {
+        val sb: ref void = string.StringBuilder.new()
+        string.StringBuilder.append_cstr(sb, "{")
+        val first: mut bool = true
+        for m in t.members {
+            if !first {
+                string.StringBuilder.append_cstr(sb, ", ")
+            }
+            first = false
+            string.StringBuilder.append_cstr(sb, m.name)
+            string.StringBuilder.append_cstr(sb, " = ")
+            string.StringBuilder.append_cstr(sb, render_value(s, m.type_off, addr + m.offset, depth + 1))
+        }
+        string.StringBuilder.append_cstr(sb, "}")
+        val built2: string.String = string.StringBuilder.build(sb)
+        val out2: ref u8 = util.copy_cstr(string.cstr(built2))
+        string.StringBuilder.free(sb)
+        return out2
+    }
+    val sz: i64 = type_size(info, off)
+    val value: u64 = read_scalar(s, addr, sz)
+    return format_scalar(info, off, value)
+}
+
+fn read_scalar(s: ref NativeSession, addr: u64, size: i64) u64 = trust {
+    if size <= 1 {
+        return mem_read_u8(s, addr) as u64
+    }
+    if size == 2 {
+        return mem_read_u16(s, addr) as u64
+    }
+    if size == 4 {
+        return mem_read_u32(s, addr) as u64
+    }
+    return mem_read_u64(s, addr)
+}
+
+fn read_uleb_at(data: ref u8, pos: ref u64) u64 = trust {
+    val cur: u64 = @load(@bitcast(pos, ref u64))
+    val v: u64 = util.read_uleb(data, cur)
+    @store(@bitcast(pos, ref u64), cur + util.uleb_len(data, cur))
+    return v
+}
+
+fn read_sleb_at(data: ref u8, pos: ref u64) i64 = trust {
+    val cur: u64 = @load(@bitcast(pos, ref u64))
+    val v: i64 = util.read_sleb(data, cur)
+    @store(@bitcast(pos, ref u64), cur + util.sleb_len(data, cur))
+    return v
+}
+
+fn reg_value(s: ref NativeSession, reg: i64) u64 = trust {
+    if reg == 0 {
+        return s.regs.rax
+    }
+    if reg == 1 {
+        return s.regs.rdx
+    }
+    if reg == 2 {
+        return s.regs.rcx
+    }
+    if reg == 3 {
+        return s.regs.rbx
+    }
+    if reg == 4 {
+        return s.regs.rsi
+    }
+    if reg == 5 {
+        return s.regs.rdi
+    }
+    if reg == 6 {
+        return s.regs.rbp
+    }
+    if reg == 7 {
+        return s.regs.rsp
+    }
+    if reg == 8 {
+        return s.regs.r8
+    }
+    if reg == 9 {
+        return s.regs.r9
+    }
+    if reg == 10 {
+        return s.regs.r10
+    }
+    if reg == 11 {
+        return s.regs.r11
+    }
+    if reg == 12 {
+        return s.regs.r12
+    }
+    if reg == 13 {
+        return s.regs.r13
+    }
+    if reg == 14 {
+        return s.regs.r14
+    }
+    if reg == 15 {
+        return s.regs.r15
+    }
+    if reg == 16 {
+        return s.regs.rip
+    }
+    if reg == 49 {
+        return s.regs.eflags
+    }
+    return 0
+}
+
+fn eval_fail() EvalResult = trust {
+    return {success: false, value: 0, is_value: false}
+}
+
+fn eval_ok(value: u64, is_value: bool) EvalResult = trust {
+    return {success: true, value: value, is_value: is_value}
+}
+
+/// Evaluate a DWARF location expression.
+pub fn eval_expr(
+    s: ref NativeSession,
+    off: u64,
+    len: u64
+) EvalResult = trust {
+    if s == none || s.dwarf_info == none || len == 0 {
+        return eval_fail()
+    }
+    val data: ref u8 = s.dwarf_info.info_data
+    val stack: mut [64]u64 = @zeroed
+    val sp: mut i64 = 0
+    val pos: mut u64 = off
+    val end: u64 = off + len
+    val is_value: mut bool = false
+    for {
+        if pos >= end {
+            break
+        }
+        val op: u8 = @load8(@ptradd(data, pos as i64))
+        pos++
+        if op == 0x03 {
+            // DW_OP_addr
+            val v: u64 = util.read_u64(data, pos)
+            pos += 8
+            @store(@ptradd(@addr(stack), sp * 8), v + s.bias)
+            sp++
+        } elif op == 0x06 {
+            if sp <= 0 {
+                return eval_fail()
+            }
+            sp--
+            val address: u64 = @load(@ptradd(@addr(stack), sp * 8))
+            @store(@ptradd(@addr(stack), sp * 8), mem_read_u64(s, address))
+            sp++
+        } elif op == 0x08 {
+            val v: u64 = @load8(@ptradd(data, pos as i64)) as u64
+            pos++
+            @store(@ptradd(@addr(stack), sp * 8), v)
+            sp++
+        } elif op == 0x09 {
+            val v: i64 = util.read_s8(data, pos)
+            pos++
+            @store(@ptradd(@addr(stack), sp * 8), v as u64)
+            sp++
+        } elif op == 0x0a {
+            val v: u64 = util.read_u16(data, pos) as u64
+            pos += 2
+            @store(@ptradd(@addr(stack), sp * 8), v)
+            sp++
+        } elif op == 0x0b {
+            val v: i64 = util.read_u16(data, pos) as i16 as i64
+            pos += 2
+            @store(@ptradd(@addr(stack), sp * 8), v as u64)
+            sp++
+        } elif op == 0x0c {
+            val v: u64 = util.read_u32(data, pos) as u64
+            pos += 4
+            @store(@ptradd(@addr(stack), sp * 8), v)
+            sp++
+        } elif op == 0x0d {
+            val v: i64 = util.read_u32(data, pos) as i32 as i64
+            pos += 4
+            @store(@ptradd(@addr(stack), sp * 8), v as u64)
+            sp++
+        } elif op == 0x0e {
+            val v: u64 = util.read_u64(data, pos)
+            pos += 8
+            @store(@ptradd(@addr(stack), sp * 8), v)
+            sp++
+        } elif op == 0x0f {
+            val v: u64 = util.read_u64(data, pos)
+            pos += 8
+            @store(@ptradd(@addr(stack), sp * 8), v)
+            sp++
+        } elif op == 0x10 {
+            val v: u64 = read_uleb_at(data, @addr(pos))
+            @store(@ptradd(@addr(stack), sp * 8), v)
+            sp++
+        } elif op == 0x11 {
+            val v: i64 = read_sleb_at(data, @addr(pos))
+            @store(@ptradd(@addr(stack), sp * 8), v as u64)
+            sp++
+        } elif op == 0x12 {
+            if sp <= 0 {
+                return eval_fail()
+            }
+            val v: u64 = @load(@ptradd(@addr(stack), (sp - 1) * 8))
+            @store(@ptradd(@addr(stack), sp * 8), v)
+            sp++
+        } elif op == 0x13 {
+            if sp > 0 {
+                sp--
+            }
+        } elif op == 0x14 {
+            if sp < 2 {
+                return eval_fail()
+            }
+            val v: u64 = @load(@ptradd(@addr(stack), (sp - 2) * 8))
+            @store(@ptradd(@addr(stack), sp * 8), v)
+            sp++
+        } elif op == 0x16 {
+            if sp < 2 {
+                return eval_fail()
+            }
+            val a: u64 = @load(@ptradd(@addr(stack), (sp - 1) * 8))
+            val b: u64 = @load(@ptradd(@addr(stack), (sp - 2) * 8))
+            @store(@ptradd(@addr(stack), (sp - 2) * 8), a)
+            @store(@ptradd(@addr(stack), (sp - 1) * 8), b)
+        } elif op == 0x17 {
+            if sp < 3 {
+                return eval_fail()
+            }
+            val a: u64 = @load(@ptradd(@addr(stack), (sp - 1) * 8))
+            val b: u64 = @load(@ptradd(@addr(stack), (sp - 2) * 8))
+            val c: u64 = @load(@ptradd(@addr(stack), (sp - 3) * 8))
+            @store(@ptradd(@addr(stack), (sp - 3) * 8), a)
+            @store(@ptradd(@addr(stack), (sp - 2) * 8), c)
+            @store(@ptradd(@addr(stack), (sp - 1) * 8), b)
+        } elif op == 0x1c || op == 0x1e || op == 0x1f || op == 0x22 ||
+        op == 0x24 || op == 0x25 || op == 0x26 || op == 0x27 {
+            if sp < 2 {
+                return eval_fail()
+            }
+            sp--
+            val b: u64 = @load(@ptradd(@addr(stack), sp * 8))
+            val a: u64 = @load(@ptradd(@addr(stack), (sp - 1) * 8))
+            val r: mut u64 = 0
+            if op == 0x1c {
+                r = a - b
+            } elif op == 0x1e {
+                r = a * b
+            } elif op == 0x1f {
+                if b != 0 {
+                    r = a / b
+                }
+            } elif op == 0x22 {
+                r = a + b
+            } elif op == 0x24 {
+                r = a << b
+            } elif op == 0x25 {
+                r = a >> b
+            } elif op == 0x26 {
+                r = a & b
+            } elif op == 0x27 {
+                r = a | b
+            }
+            @store(@ptradd(@addr(stack), (sp - 1) * 8), r)
+        } elif op == 0x23 {
+            if sp <= 0 {
+                return eval_fail()
+            }
+            val v: u64 = read_uleb_at(data, @addr(pos))
+            val cur: u64 = @load(@ptradd(@addr(stack), (sp - 1) * 8))
+            @store(@ptradd(@addr(stack), (sp - 1) * 8), cur + v)
+        } elif op >= 0x50 && op <= 0x6f {
+            @store(@ptradd(@addr(stack), sp * 8), reg_value(s, (op - 0x50) as i64))
+            sp++
+        } elif op >= 0x70 && op <= 0x8f {
+            val offv: i64 = read_sleb_at(data, @addr(pos))
+            @store(@ptradd(@addr(stack), sp * 8), reg_value(s, (op - 0x70) as i64) + offv as u64)
+            sp++
+        } elif op == 0x91 {
+            val offv: i64 = read_sleb_at(data, @addr(pos))
+            @store(@ptradd(@addr(stack), sp * 8), s.regs.rbp + offv as u64)
+            sp++
+        } elif op == 0x92 {
+            val reg: u64 = read_uleb_at(data, @addr(pos))
+            val offv: i64 = read_sleb_at(data, @addr(pos))
+            @store(@ptradd(@addr(stack), sp * 8), reg_value(s, reg as i64) + offv as u64)
+            sp++
+        } elif op == 0x9c {
+            @store(@ptradd(@addr(stack), sp * 8), s.regs.rbp + 16)
+            sp++
+        } elif op == 0x9f {
+            is_value = true
+        } elif op == 0xa1 {
+            read_uleb_at(data, @addr(pos))
+            // addrx support is uncommon for locals; treat zero as unsupported.
+            @store(@ptradd(@addr(stack), sp * 8), 0)
+            sp++
+        } elif op == 0x93 {
+            // DW_OP_piece: stop at the first piece.
+            break
+        } else {
+            return eval_fail()
+        }
+    }
+    if sp <= 0 {
+        return eval_fail()
+    }
+    val finalv: u64 = @load(@ptradd(@addr(stack), (sp - 1) * 8))
+    return eval_ok(finalv, is_value)
+}
+
+/// Return the current source location as `file:line`, or empty.
+pub fn current_location(s: ref NativeSession) ref u8 = trust {
+    if s == none || !s.stopped || s.dwarf_info == none {
+        return ""
+    }
+    val row: ref dwarf.DwarfLineRow = dwarf.line_for_pc(s.dwarf_info, s.regs.rip - s.bias)
+    if row == none || string.len_raw(row.file) == 0 {
+        return ""
+    }
+    return @fmtalloc("{s}:{lld}", {row.file, row.line})
+}
+
+/// Return the current function's display name.
+pub fn current_function_name(s: ref NativeSession) ref u8 = trust {
+    if s == none {
+        return ""
+    }
+    if s.current_function != none {
+        return s.current_function.display
+    }
+    val sym_opt = elf.symbol_for_addr(s.elf_file, s.regs.rip - s.bias)
+    if sym_opt is some sym {
+        return demangle.pretty(sym.name)
+    }
+    return @fmtalloc("0x{x}", {s.regs.rip})
+}
+
+/// Backtrace is intentionally shallow for the native backend: one frame from
+/// DWARF line info plus a frame-pointer chain when available.
+pub fn backtrace(s: ref NativeSession) ref u8 = trust {
+    val sb: ref void = string.StringBuilder.new()
+    val pc: mut u64 = s.regs.rip - s.bias
+    val fp: mut u64 = s.regs.rbp
+    val depth: mut i64 = 0
+    for {
+        if depth >= 16 {
+            break
+        }
+        val f: ref dwarf.DwarfFunction = dwarf.function_for_pc(s.dwarf_info, pc)
+        val name: mut ref u8 = @fmtalloc("0x{x}", {pc})
+        val file: mut ref u8 = ""
+        val line: mut i64 = 0
+        if f != none {
+            name = f.display
+            val row: ref dwarf.DwarfLineRow = dwarf.line_for_pc(s.dwarf_info, pc)
+            if row != none {
+                file = row.file
+                line = row.line
+            }
+        } else {
+            val sym_opt = elf.symbol_for_addr(s.elf_file, pc)
+            if sym_opt is some sym {
+                name = demangle.pretty(sym.name)
+            }
+        }
+        if string.len_raw(file) > 0 {
+            string.StringBuilder.append_cstr(sb, @fmtalloc("frame #{lld}: {s} at {s}:{lld}\n", {depth, name, file, line}))
+        } else {
+            string.StringBuilder.append_cstr(sb, @fmtalloc("frame #{lld}: {s}\n", {depth, name}))
+        }
+        if fp == 0 {
+            break
+        }
+        val next_fp: u64 = mem_read_u64(s, fp)
+        val ret: u64 = mem_read_u64(s, fp + 8)
+        if ret == 0 || next_fp <= fp {
+            break
+        }
+        pc = ret - s.bias
+        fp = next_fp
+        depth++
+    }
+    val built: string.String = string.StringBuilder.build(sb)
+    val out: ref u8 = util.copy_cstr(string.cstr(built))
+    string.StringBuilder.free(sb)
+    return out
+}
+
+
+fn trim_raw(s: ref u8) ref u8 = trust {
+    if s == none {
+        return ""
+    }
+    val n: i64 = string.len_raw(s)
+    val start: mut i64 = 0
+    val end: mut i64 = n
+    for {
+        if start >= end {
+            break
+        }
+        val c: u8 = @load8(@ptradd(s, start))
+        if c != 32 && c != 9 {
+            break
+        }
+        start++
+    }
+    for {
+        if end <= start {
+            break
+        }
+        val c: u8 = @load8(@ptradd(s, end - 1))
+        if c != 32 && c != 9 {
+            break
+        }
+        end--
+    }
+    return util.copy_cstr_len(@ptradd(s, start), end - start)
+}
+
+fn member_named(t: ref dwarf.DwarfType, name: ref u8) ref dwarf.DwarfMember = trust {
+    if t == none {
+        return none
+    }
+    for m in t.members {
+        if string.str_eql(m.name, name) {
+            return m
+        }
+    }
+    return none
+}
+
+/// Evaluate a simple source expression such as `x`, `point.x`, or `arr[2]`.
+/// More complex expressions are intentionally left to the LLDB backend.
+pub fn read_expression(s: ref NativeSession, expr_in: ref u8) ref u8 = trust {
+    if s == none || !s.stopped || s.current_function == none {
+        return ""
+    }
+    val expr: ref u8 = trim_raw(expr_in)
+    val n: i64 = string.len_raw(expr)
+    if n == 0 {
+        return ""
+    }
+    val i: mut i64 = 0
+    for {
+        if i >= n {
+            break
+        }
+        val c: u8 = @load8(@ptradd(expr, i))
+        val ident: bool = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+        if !ident {
+            break
+        }
+        i++
+    }
+    if i == 0 {
+        return ""
+    }
+    val base: ref u8 = util.copy_cstr_len(expr, i)
+    val v: ref dwarf.DwarfVariable = dwarf.find_variable(s.current_function, base)
+    if v == none || v.loc_len == 0 {
+        return ""
+    }
+    val er: EvalResult = eval_expr(s, v.loc_off, v.loc_len)
+    if !er.success {
+        return ""
+    }
+    val addr: mut u64 = er.value
+    val is_value: bool = er.is_value
+    val type_off: mut u64 = v.type_off
+    if is_value {
+        return format_scalar(s.dwarf_info, type_off, addr)
+    }
+    for {
+        if i >= n {
+            break
+        }
+        val c: u8 = @load8(@ptradd(expr, i))
+        if c == 46 {
+            i++
+            val start: i64 = i
+            for {
+                if i >= n {
+                    break
+                }
+                val d: u8 = @load8(@ptradd(expr, i))
+                if d == 46 || d == 91 {
+                    break
+                }
+                i++
+            }
+            val field: ref u8 = util.copy_cstr_len(@ptradd(expr, start), i - start)
+            val t: ref dwarf.DwarfType = unwrap_type(s.dwarf_info, type_off)
+            val m: ref dwarf.DwarfMember = member_named(t, field)
+            if m == none {
+                return ""
+            }
+            addr = addr + m.offset
+            type_off = m.type_off
+        } elif c == 91 {
+            i++
+            val start_idx: i64 = i
+            for {
+                if i >= n {
+                    break
+                }
+                val d: u8 = @load8(@ptradd(expr, i))
+                if d == 93 {
+                    break
+                }
+                i++
+            }
+            val idx_opt = util.parse_i64(util.copy_cstr_len(@ptradd(expr, start_idx), i - start_idx))
+            val idx: mut i64 = 0
+            if idx_opt is some iv {
+                idx = iv as i64
+            } else {
+                return ""
+            }
+            val t: ref dwarf.DwarfType = unwrap_type(s.dwarf_info, type_off)
+            if t == none || t.tag != 1 {
+                return ""
+            }
+            val esz: i64 = type_size(s.dwarf_info, t.type_off)
+            addr = addr + (idx * esz) as u64
+            type_off = t.type_off
+            if i < n && @load8(@ptradd(expr, i)) == 93 {
+                i++
+            }
+        } else {
+            break
+        }
+    }
+    return render_value(s, type_off, addr, 0)
+}
+
+/// Stop the native process.
+pub fn quit(s: mut ref NativeSession) void = trust {
+    if s == none {
+        return
+    }
+    if s.started && !s.exited && s.pid > 0 {
+        kill(s.pid, 9)
+        val status: mut i32 = 0
+        waitpid(s.pid, @addr(status), 0)
+    }
+    if s.mem_fd >= 0 {
+        close(s.mem_fd)
+        s.mem_fd = -1
+    }
+    s.exited = true
+    s.stopped = false
+}

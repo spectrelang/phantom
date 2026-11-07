@@ -1,0 +1,402 @@
+/// Minimal ELF64 little-endian reader used by Phantom's native DWARF backend.
+///
+/// (C) Navid Momtahen - 2026
+/// SPDX-License-Identifier: GPL-3.0-only
+
+val fs         = use("std/fs")
+val string     = use("std/string")
+val allocators = use("std/allocators")
+val util       = use("util.sx")
+
+pub type ElfSection = {
+    name: mut ref u8
+    name_off: mut u32
+    typ: mut u32
+    flags: mut u64
+    addr: mut u64
+    offset: mut u64
+    size: mut u64
+    link_idx: mut u32
+    info: mut u32
+    align: mut u64
+    entsize: mut u64
+}
+
+pub type ElfSymbol = {
+    name: mut ref u8
+    value: mut u64
+    size: mut u64
+    info: mut u8
+    other: mut u8
+    shndx: mut u16
+}
+
+pub type ElfFile = {
+    path: mut ref u8
+    data: mut ref u8
+    size: mut i64
+    is_64: mut bool
+    is_le: mut bool
+    etype: mut u16
+    machine: mut u16
+    entry: mut u64
+    shstrndx: mut u16
+    sections: mut list[ref ElfSection]
+    symbols: mut list[ref ElfSymbol]
+    bias: mut u64
+}
+
+fn u16_at(data: ref u8, off: u64) u16 = trust {
+    return util.read_u16(data, off)
+}
+
+fn u32_at(data: ref u8, off: u64) u32 = trust {
+    return util.read_u32(data, off)
+}
+
+fn u64_at(data: ref u8, off: u64) u64 = trust {
+    return util.read_u64(data, off)
+}
+
+/// Load an ELF file into `arena`.
+pub fn load(
+    arena: allocators.Arena,
+    path: ref u8
+) result[ref ElfFile, ref u8] = trust {
+    val size_opt = fs.file_size(path)
+    val sz: mut i64 = 0
+    if size_opt is some szv {
+        sz = szv as i64
+    } else {
+        return err @fmtalloc("cannot read '{s}'", {path})
+    }
+    if sz < 64 {
+        return err @fmtalloc("'{s}' is not an ELF file", {path})
+    }
+    val data_opt = fs.read_all[allocators.Arena](arena, path)
+    val data: mut ref u8 = none
+    if data_opt is some dv {
+        data = dv as ref u8
+    } else {
+        return err @fmtalloc("cannot read '{s}'", {path})
+    }
+    if @load8(data) != 127 || @load8(@ptradd(data, 1)) != 69 ||
+    @load8(@ptradd(data, 2)) != 76 || @load8(@ptradd(data, 3)) != 70 {
+        return err @fmtalloc("'{s}' is not an ELF file", {path})
+    }
+    val klass: u8 = @load8(@ptradd(data, 4))
+    val enc: u8 = @load8(@ptradd(data, 5))
+    if klass != 2 {
+        return err @fmtalloc("only ELF64 files are supported")
+    }
+    if enc != 1 {
+        return err @fmtalloc("only little-endian ELF files are supported")
+    }
+
+    val e: mut ref ElfFile = allocators.Arena.alloc_or_none(
+        arena,
+        @sizeof(ElfFile) as usize
+    ) as ref ElfFile
+    if e == none {
+        return err @fmtalloc("out of memory")
+    }
+    @memset(e, 0, @sizeof(ElfFile) as usize)
+    e.path = path
+    e.data = data
+    e.size = sz
+    e.is_64 = true
+    e.is_le = true
+    e.etype = u16_at(data, 16)
+    e.machine = u16_at(data, 18)
+    e.entry = u64_at(data, 24)
+    val shoff: u64 = u64_at(data, 40)
+    val shentsize: u16 = u16_at(data, 58)
+    val shnum: u16 = u16_at(data, 60)
+    e.shstrndx = u16_at(data, 62)
+    if shoff == 0 || shnum == 0 || shentsize < 64 {
+        return ok e
+    }
+
+    e.sections = @listalloc[allocators.HeapAllocator, ref ElfSection](util.heap())?
+    val i: mut u32 = 0
+    for {
+        if (i as u64) >= (shnum as u64) {
+            break
+        }
+        val off: u64 = shoff + (i as u64) * (shentsize as u64)
+        if off + 64 > (sz as u64) {
+            break
+        }
+        val s: mut ref ElfSection = allocators.Arena.alloc_or_none(
+            arena,
+            @sizeof(ElfSection) as usize
+        ) as ref ElfSection
+        @memset(s, 0, @sizeof(ElfSection) as usize)
+        s.name_off = u32_at(data, off)
+        s.typ = u32_at(data, off + 4)
+        s.flags = u64_at(data, off + 8)
+        s.addr = u64_at(data, off + 16)
+        s.offset = u64_at(data, off + 24)
+        s.size = u64_at(data, off + 32)
+        s.link_idx = u32_at(data, off + 40)
+        s.info = u32_at(data, off + 44)
+        s.align = u64_at(data, off + 48)
+        s.entsize = u64_at(data, off + 56)
+        @append(e.sections, s)
+        i++
+    }
+
+    val shstr_opt = get_section(e, e.shstrndx as i64)
+    if shstr_opt is some shstr {
+        if shstr.offset < (sz as u64) {
+            val strbase: ref u8 = @ptradd(data, shstr.offset as i64)
+            val scount: i64 = @len(e.sections) as i64
+            val sj: mut i64 = 0
+            for {
+                if sj >= scount {
+                    break
+                }
+                val so = @get(e.sections, sj as usize)
+                if so is some s_raw {
+                    val s: mut ref ElfSection = s_raw as ref ElfSection
+                    s.name = @ptradd(strbase, s.name_off as i64)
+                }
+                sj++
+            }
+        }
+    }
+
+    load_symbols(e, arena)
+    return ok e
+}
+
+/// Return a section by index, or none.
+pub fn get_section(e: ref ElfFile, index: i64) option[ref ElfSection] = trust {
+    if index < 0 {
+        return none
+    }
+    return @get(e.sections, index as usize)
+}
+
+/// Return a section by name, or none.
+pub fn section_by_name(e: ref ElfFile, name: ref u8) option[ref ElfSection] = trust {
+    for s in e.sections {
+        if s.name != none && string.str_eql(s.name, name) {
+            return some s
+        }
+    }
+    return none
+}
+
+/// Return the start address of a section's bytes.
+pub fn section_data(e: ref ElfFile, sec: ref ElfSection) ref u8 = trust {
+    return @ptradd(e.data, sec.offset as i64)
+}
+
+fn load_symbols(e: mut ref ElfFile, arena: allocators.Arena) void = trust {
+    val sym_opt = section_by_name(e, ".symtab")
+    val symtab: mut ref ElfSection = none
+    if sym_opt is some sv {
+        symtab = sv as ref ElfSection
+    } else {
+        return
+    }
+    if symtab.entsize < 24 || symtab.size < 24 {
+        return
+    }
+    val str_opt = get_section(e, symtab.link_idx as i64)
+    val strtab: mut ref ElfSection = none
+    if str_opt is some sv2 {
+        strtab = sv2 as ref ElfSection
+    } else {
+        return
+    }
+    val strdata: ref u8 = section_data(e, strtab)
+    val count: i64 = (symtab.size / symtab.entsize) as i64
+    e.symbols = @listalloc[allocators.HeapAllocator, ref ElfSymbol](util.heap())?
+    val si: mut i64 = 0
+    for {
+        if si >= count {
+            break
+        }
+        val off: u64 = symtab.offset + (si as u64) * symtab.entsize
+        if off + 24 > (e.size as u64) {
+            break
+        }
+        val name_off: u32 = u32_at(e.data, off)
+        val info: u8 = @load8(@ptradd(e.data, off + 4))
+        val other: u8 = @load8(@ptradd(e.data, off + 5))
+        val shndx: u16 = u16_at(e.data, off + 6)
+        val value: u64 = u64_at(e.data, off + 8)
+        val ssize: u64 = u64_at(e.data, off + 16)
+        if name_off != 0 {
+            val s: mut ref ElfSymbol = allocators.Arena.alloc_or_none(
+                arena,
+                @sizeof(ElfSymbol) as usize
+            ) as ref ElfSymbol
+            @memset(s, 0, @sizeof(ElfSymbol) as usize)
+            s.name = @ptradd(strdata, name_off as i64)
+            s.value = value
+            s.size = ssize
+            s.info = info
+            s.other = other
+            s.shndx = shndx
+            @append(e.symbols, s)
+        }
+        si++
+    }
+}
+
+fn symbol_type(s: ref ElfSymbol) i64 = trust {
+    return (s.info & 15) as i64
+}
+
+/// Return true when the symbol is a function or object with a real address.
+pub fn symbol_is_code(s: ref ElfSymbol) bool = trust {
+    val t: i64 = symbol_type(s)
+    if t == 2 {
+        return true
+    }
+    if t == 0 {
+        return s.value != 0
+    }
+    return false
+}
+
+/// Return true when the symbol is a data object.
+pub fn symbol_is_data(s: ref ElfSymbol) bool = trust {
+    return symbol_type(s) == 1
+}
+
+/// Find the first symbol with an exact raw name.
+pub fn symbol_by_name(e: ref ElfFile, name: ref u8) option[ref ElfSymbol] = trust {
+    for s in e.symbols {
+        if string.str_eql(s.name, name) {
+            return some s
+        }
+    }
+    return none
+}
+
+/// Find the symbol containing `addr`, preferring exact ranges.
+pub fn symbol_for_addr(e: ref ElfFile, addr: u64) option[ref ElfSymbol] = trust {
+    val found: mut ref ElfSymbol = none
+    val best_size: mut u64 = 0
+    for s in e.symbols {
+        if !symbol_is_code(s) {
+            continue
+        }
+        if s.size > 0 {
+            if addr >= s.value && addr < s.value + s.size {
+                if found == none || s.size < best_size {
+                    found = s
+                    best_size = s.size
+                }
+            }
+        } elif addr == s.value && found == none {
+            found = s
+        }
+    }
+    if found != none {
+        return some found
+    }
+    // Fall back to the nearest preceding symbol.
+    val best: mut ref ElfSymbol = none
+    for s in e.symbols {
+        if !symbol_is_code(s) || s.value == 0 {
+            continue
+        }
+        if s.value <= addr {
+            if best == none || s.value > best.value {
+                best = s
+            }
+        }
+    }
+    if best != none {
+        return some best
+    }
+    return none
+}
+
+/// Return the load bias for a PIE/ET_DYN binary at runtime.
+pub fn runtime_bias(e: ref ElfFile, maps_path: ref u8) u64 = trust {
+    if e.etype != 3 {
+        return 0
+    }
+    val size_opt = fs.file_size(maps_path)
+    val sz: mut i64 = 0
+    if size_opt is some szv {
+        sz = szv as i64
+    } else {
+        return 0
+    }
+    // Parse /proc/<pid>/maps for the first executable mapping of this binary.
+    val arena: allocators.Arena = allocators.Arena.new((sz + 4096) as usize)?
+    val data_opt = fs.read_all[allocators.Arena](arena, maps_path)
+    val data: mut ref u8 = none
+    if data_opt is some dv {
+        data = dv as ref u8
+    } else {
+        allocators.Arena.free(arena)
+        return 0
+    }
+    val base: mut u64 = 0
+    val pos: mut i64 = 0
+    for {
+        if pos >= sz {
+            break
+        }
+        val line_end: mut i64 = pos
+        for {
+            if line_end >= sz || @load8(@ptradd(data, line_end)) == 10 {
+                break
+            }
+            line_end++
+        }
+        // Find " r-xp " / " r--p " and the path after the 5th field.
+        val dash: mut i64 = -1
+        val i: mut i64 = pos
+        for {
+            if i >= line_end {
+                break
+            }
+            if @load8(@ptradd(data, i)) == 45 {
+                dash = i
+                break
+            }
+            i++
+        }
+        if dash > pos {
+            val start_txt: ref u8 = util.copy_cstr_len(@ptradd(data, pos), dash - pos)
+            val start_addr_opt = util.parse_u64_hex(start_txt)
+            if start_addr_opt is some start_addr {
+                // If the mapping belongs to our binary, use its start address.
+                val path_start: mut i64 = line_end
+                val slash: mut i64 = line_end - 1
+                for {
+                    if slash < pos {
+                        break
+                    }
+                    if @load8(@ptradd(data, slash)) == 47 {
+                        path_start = slash
+                        break
+                    }
+                    slash--
+                }
+                if path_start >= pos {
+                    val map_path: ref u8 = util.copy_cstr_len(
+                        @ptradd(data, path_start),
+                        line_end - path_start
+                    )
+                    if util.ends_with(map_path, util.basename(e.path)) {
+                        base = start_addr
+                        break
+                    }
+                }
+            }
+        }
+        pos = line_end + 1
+    }
+    allocators.Arena.free(arena)
+    return base
+}

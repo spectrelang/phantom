@@ -1,0 +1,354 @@
+/// Minimal shared helpers for Phantom.
+///
+/// (C) Navid Momtahen - 2026
+/// SPDX-License-Identifier: GPL-3.0-only
+
+val stdio      = use("std/stdio")
+val string     = use("std/string")
+val allocators = use("std/allocators")
+
+/// Allocate a zeroed buffer and return it as a C string.
+pub fn alloc_cstr(len: i64) ref u8 = trust {
+    if len < 0 {
+        return none
+    }
+    val buf: ref u8 = @alloc((len + 1) as usize) as ref u8
+    if buf == none {
+        return none
+    }
+    @memset(buf, 0, (len + 1) as usize)
+    return buf
+}
+
+/// Copy `len` bytes from `src` into a fresh NUL-terminated buffer.
+pub fn copy_cstr_len(src: ref u8, len: i64) ref u8 = trust {
+    if src == none || len < 0 {
+        return none
+    }
+    val out: ref u8 = alloc_cstr(len)
+    if out == none {
+        return none
+    }
+    if len > 0 {
+        @memcpy(out, src, len as usize)
+    }
+    return out
+}
+
+/// Duplicate a C string.
+pub fn copy_cstr(src: ref u8) ref u8 = trust {
+    if src == none {
+        return none
+    }
+    return copy_cstr_len(src, string.len_raw(src))
+}
+
+/// Return the basename component of a path.
+pub fn basename(path: ref u8) ref u8 = trust {
+    if path == none {
+        return ""
+    }
+    val n: i64 = string.len_raw(path)
+    val i: mut i64 = n - 1
+    for {
+        if i < 0 {
+            break
+        }
+        val c: u8 = @load8(@ptradd(path, i))
+        if c == 47 || c == 92 {
+            return @ptradd(path, i + 1)
+        }
+        i--
+    }
+    return path
+}
+
+/// Return the directory component of a path, or "." if there is none.
+pub fn dirname(path: ref u8) ref u8 = trust {
+    if path == none {
+        return "."
+    }
+    val n: i64 = string.len_raw(path)
+    val i: mut i64 = n - 1
+    for {
+        if i < 0 {
+            break
+        }
+        val c: u8 = @load8(@ptradd(path, i))
+        if c == 47 || c == 92 {
+            if i == 0 {
+                return "/"
+            }
+            return copy_cstr_len(path, i)
+        }
+        i--
+    }
+    return "."
+}
+
+/// True when `s` starts with `prefix`.
+pub fn starts_with(s: ref u8, prefix: ref u8) bool = trust {
+    return string.raw_starts_with(s, prefix)
+}
+
+/// True when `s` ends with `suffix`.
+pub fn ends_with(s: ref u8, suffix: ref u8) bool = trust {
+    return string.raw_ends_with(s, suffix)
+}
+
+/// True when `s` contains `needle`.
+pub fn contains(s: ref u8, needle: ref u8) bool = trust {
+    if s == none || needle == none {
+        return false
+    }
+    val n: i64 = string.len_raw(s)
+    val m: i64 = string.len_raw(needle)
+    if m == 0 {
+        return true
+    }
+    if n < m {
+        return false
+    }
+    val i: mut i64 = 0
+    for {
+        if i > n - m {
+            break
+        }
+        val matched: mut bool = true
+        val j: mut i64 = 0
+        for {
+            if j >= m {
+                break
+            }
+            if @load8(@ptradd(s, i + j)) != @load8(@ptradd(needle, j)) {
+                matched = false
+                break
+            }
+            j++
+        }
+        if matched {
+            return true
+        }
+        i++
+    }
+    return false
+}
+
+/// Parse a decimal i64. Returns none on invalid input.
+pub fn parse_i64(text: ref u8) option[i64] = trust {
+    if text == none {
+        return none
+    }
+    val n: i64 = string.len_raw(text)
+    if n <= 0 {
+        return none
+    }
+    val i: mut i64 = 0
+    val neg: mut bool = false
+    if @load8(@ptradd(text, 0)) == 45 {
+        neg = true
+        i = 1
+    }
+    if i >= n {
+        return none
+    }
+    val value: mut i64 = 0
+    for {
+        if i >= n {
+            break
+        }
+        val c: u8 = @load8(@ptradd(text, i))
+        if c < 48 || c > 57 {
+            return none
+        }
+        value = value * 10 + ((c - 48) as i64)
+        i++
+    }
+    if neg {
+        value = -value
+    }
+    return some value
+}
+
+/// Parse a hexadecimal u64, with an optional 0x/0X prefix.
+pub fn parse_u64_hex(text: ref u8) option[u64] = trust {
+    if text == none {
+        return none
+    }
+    val n: i64 = string.len_raw(text)
+    val i: mut i64 = 0
+    if n >= 2 {
+        val c0: u8 = @load8(@ptradd(text, 0))
+        val c1: u8 = @load8(@ptradd(text, 1))
+        if c0 == 48 && (c1 == 120 || c1 == 88) {
+            i = 2
+        }
+    }
+    if i >= n {
+        return none
+    }
+    val value: mut u64 = 0
+    for {
+        if i >= n {
+            break
+        }
+        val c: u8 = @load8(@ptradd(text, i))
+        val d: mut i64 = -1
+        if c >= 48 && c <= 57 {
+            d = (c - 48) as i64
+        } elif c >= 97 && c <= 102 {
+            d = (c - 97 + 10) as i64
+        } elif c >= 65 && c <= 70 {
+            d = (c - 65 + 10) as i64
+        }
+        if d < 0 {
+            return none
+        }
+        value = (value << 4) | (d as u64)
+        i++
+    }
+    return some value
+}
+
+/// Format a u64 as lowercase hexadecimal without a prefix.
+pub fn hex_u64(value: u64) ref u8 = trust {
+    val digits: ref u8 = "0123456789abcdef"
+    val buf: ref u8 = alloc_cstr(18)
+    if buf == none {
+        return ""
+    }
+    if value == 0 {
+        @store8(buf, 48)
+        return buf
+    }
+    val tmp: ref u8 = alloc_cstr(18)
+    val n: mut i64 = 0
+    val v: mut u64 = value
+    for {
+        if v == 0 {
+            break
+        }
+        val d: u8 = @load8(@ptradd(digits, (v & 15) as i64))
+        @store8(@ptradd(tmp, n), d)
+        n++
+        v = v >> 4
+    }
+    val i: mut i64 = 0
+    for {
+        if i >= n {
+            break
+        }
+        @store8(@ptradd(buf, i), @load8(@ptradd(tmp, n - 1 - i)))
+        i++
+    }
+    @free(tmp)
+    return buf
+}
+
+/// Read a little-endian u16.
+pub fn read_u16(data: ref u8, off: u64) u16 = trust {
+    val p: ref u8 = @ptradd(data, off as i64) as ref u8
+    return (@load8(p) as u16) | ((@load8(@ptradd(p, 1)) as u16) << 8)
+}
+
+/// Read a little-endian u32.
+pub fn read_u32(data: ref u8, off: u64) u32 = trust {
+    val p: ref u8 = @ptradd(data, off as i64) as ref u8
+    return (@load8(p) as u32)
+    | ((@load8(@ptradd(p, 1)) as u32) << 8)
+    | ((@load8(@ptradd(p, 2)) as u32) << 16)
+    | ((@load8(@ptradd(p, 3)) as u32) << 24)
+}
+
+/// Read a little-endian u64.
+pub fn read_u64(data: ref u8, off: u64) u64 = trust {
+    val lo: u64 = read_u32(data, off) as u64
+    val hi: u64 = read_u32(data, off + 4) as u64
+    return lo | (hi << 32)
+}
+
+/// Read a little-endian signed byte.
+pub fn read_s8(data: ref u8, off: u64) i64 = trust {
+    val b: u8 = @load8(@ptradd(data, off as i64))
+    if b >= 128 {
+        return (b as i64) - 256
+    }
+    return b as i64
+}
+
+/// Read a signed LEB128 value.
+pub fn read_sleb(data: ref u8, off: u64) i64 = trust {
+    val result: mut i64 = 0
+    val shift: mut i64 = 0
+    val pos: mut u64 = off
+    for {
+        val b: u8 = @load8(@ptradd(data, pos as i64))
+        pos++
+        result = result | (((b & 127) as i64) << shift)
+        shift += 7
+        if (b & 128) == 0 {
+            if shift < 64 && (b & 64) != 0 {
+                result = result | (-1 << shift)
+            }
+            break
+        }
+        if shift > 63 {
+            break
+        }
+    }
+    return result
+}
+
+/// Read an unsigned LEB128 value.
+pub fn read_uleb(data: ref u8, off: u64) u64 = trust {
+    val result: mut u64 = 0
+    val shift: mut i64 = 0
+    val pos: mut u64 = off
+    for {
+        val b: u8 = @load8(@ptradd(data, pos as i64))
+        pos++
+        result = result | (((b & 127) as u64) << shift)
+        shift += 7
+        if (b & 128) == 0 {
+            break
+        }
+        if shift > 63 {
+            break
+        }
+    }
+    return result
+}
+
+/// Return the byte length of a ULEB128 value at `off`.
+pub fn uleb_len(data: ref u8, off: u64) u64 = trust {
+    val pos: mut u64 = off
+    for {
+        val b: u8 = @load8(@ptradd(data, pos as i64))
+        pos++
+        if (b & 128) == 0 {
+            break
+        }
+    }
+    return pos - off
+}
+
+/// Return the byte length of an SLEB128 value at `off`.
+pub fn sleb_len(data: ref u8, off: u64) u64 = trust {
+    return uleb_len(data, off)
+}
+
+/// Zero-copy case-insensitive? No: exact string equality helper.
+pub fn eq(a: ref u8, b: ref u8) bool = trust {
+    return string.str_eql(a, b)
+}
+
+/// Print a diagnostic prefixed with "phantom: ".
+pub fn die(msg: ref u8) void = trust {
+    stdio.eprint("phantom: {s}\n", {msg})
+}
+
+/// Return a zero-sized heap allocator, used for lists whose lifetime is the
+/// entire debugger process.
+pub fn heap() allocators.HeapAllocator = trust {
+    return @zeroed
+}

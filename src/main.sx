@@ -1,0 +1,451 @@
+/// Phantom - Debugger for Spectrelang
+///
+/// (C) Navid Momtahen - 2026
+/// SPDX-License-Identifier: GPL-3.0-only
+
+val stdio      = use("std/stdio")
+val string     = use("std/string")
+val os         = use("std/os")
+val allocators = use("std/allocators")
+val util       = use("util.sx")
+val target     = use("target.sx")
+val cli        = use("cli.sx")
+val dap        = use("dap.sx")
+val demangle   = use("demangle.sx")
+val elf        = use("elf.sx")
+val dwarf      = use("dwarf.sx")
+
+val VERSION: ref u8 = "0.1.0"
+
+fn arg_at(args: list[ref u8], index: i64) ref u8 = trust {
+    val opt = @get(args, index as usize)
+    if opt is some v {
+        return v as ref u8
+    }
+    return ""
+}
+
+fn strip_sx_ext(name: ref u8) ref u8 = trust {
+    if string.raw_ends_with(name, ".sx") {
+        return util.copy_cstr_len(name, string.len_raw(name) - 3)
+    }
+    return name
+}
+
+fn file_exists(path_in: ref u8) bool = trust {
+    return os.exists(path_in)
+}
+
+fn find_compiler(explicit: ref u8) ref u8 = trust {
+    if explicit != none && string.len_raw(explicit) > 0 {
+        return explicit
+    }
+    val env1 = os.getenv("PHANTOM_COMPILER")
+    if env1 != none && string.len_raw(env1) > 0 {
+        return env1
+    }
+    val env2 = os.getenv("SPECTRE_COMPILER")
+    if env2 != none && string.len_raw(env2) > 0 {
+        return env2
+    }
+    if os.in_path("spectre-dev") {
+        return "spectre-dev"
+    }
+    if os.in_path("spectre") {
+        return "spectre"
+    }
+    if file_exists("../spectre/spectre-dev") {
+        return "../spectre/spectre-dev"
+    }
+    if file_exists("../spectre/spectre") {
+        return "../spectre/spectre"
+    }
+    return "spectre"
+}
+
+fn build_source(compiler: ref u8, source: ref u8) result[ref u8, ref u8] = trust {
+    val base: ref u8 = strip_sx_ext(util.basename(source))
+    val out: ref u8 = @fmtalloc("/tmp/phantom-{d}-{s}", {native_pid(), base})
+    val cmd: ref u8 = @fmtalloc(
+        "{s} {s} -alt -no-single-flags -o {s} 2>&1",
+        {compiler, source, out}
+    )
+    val res = os.exec(cmd)
+    match res {
+        err e => {
+            return err @fmtalloc("could not run compiler '{s}': {s}", {compiler, e})
+        }
+        ok output => {
+            if !file_exists(out) {
+                val text: ref u8 = string.cstr(output)
+                return err @fmtalloc("build failed:\n{s}", {text})
+            }
+        }
+    }
+    return ok out
+}
+
+fn native_pid() i32 = trust {
+    return pid_via_os()
+}
+
+when posix {
+    extern (C, header) fn getpid() i32 = "getpid"
+}
+
+fn pid_via_os() i32 = trust {
+    when windows {
+        return 0
+    }
+    return getpid()
+}
+
+fn load_target(arena: allocators.Arena, program: ref u8) result[ref target.Target, ref u8] = trust {
+    return target.load(arena, program)
+}
+
+fn cmd_symbols(program: ref u8, query: ref u8) i32 = trust {
+    val arena: allocators.Arena = allocators.Arena.new(64 * 1024 * 1024 as usize)?
+    val t_opt = load_target(arena, program)
+    val t: mut ref target.Target = none
+    match t_opt {
+        err e => {
+            stdio.print("phantom: {s}\n", {e})
+            return 1
+        }
+        ok tv => {
+            t = tv
+        }
+    }
+    if string.len_raw(query) > 0 {
+        val fns: list[ref dwarf.DwarfFunction] = target.find_functions(t, query, 200)
+        for f in fns {
+            stdio.print("{s} -> {s} [{x}..{x}]\n", {f.display, f.name, f.low_pc, f.high_pc})
+        }
+        for sym in t.elf_file.symbols {
+            if elf.symbol_is_code(sym) && demangle.matches(sym.name, query) {
+                stdio.print("{s} -> {s} [{x}]\n", {demangle.pretty(sym.name), sym.name, sym.value})
+            }
+        }
+        return 0
+    }
+    for f in t.dwarf_info.functions {
+        stdio.print("{s} -> {s} [{x}..{x}]\n", {f.display, f.name, f.low_pc, f.high_pc})
+    }
+    return 0
+}
+
+fn cmd_lines(program: ref u8, query: ref u8) i32 = trust {
+    val arena: allocators.Arena = allocators.Arena.new(64 * 1024 * 1024 as usize)?
+    val t_opt = load_target(arena, program)
+    val t: mut ref target.Target = none
+    match t_opt {
+        err e => {
+            stdio.print("phantom: {s}\n", {e})
+            return 1
+        }
+        ok tv => {
+            t = tv
+        }
+    }
+    if string.len_raw(query) == 0 {
+        for row in t.dwarf_info.lines {
+            if row.is_stmt && string.len_raw(row.file) > 0 {
+                stdio.print("{s}:{lld} -> 0x{x}\n", {row.file, row.line, row.address})
+            }
+        }
+        return 0
+    }
+    val colon: i64 = last_colon(query)
+    if colon > 0 {
+        val file: ref u8 = util.copy_cstr_len(query, colon)
+        val line_opt = util.parse_i64(@ptradd(query, colon + 1))
+        if line_opt is some line {
+            val addr_opt = target.line_address(t, file, line)
+            if addr_opt is some addr {
+                stdio.print("{s}:{lld} -> 0x{x}\n", {file, line, addr})
+            } else {
+                stdio.print("phantom: no address for {s}:{lld}\n", {file, line})
+            }
+        }
+    } else {
+        val sym_opt = target.function_address(t, query)
+        if sym_opt is some addr {
+            stdio.print("{s} -> 0x{x}\n", {query, addr})
+        } else {
+            stdio.print("phantom: no symbol matching '{s}'\n", {query})
+        }
+    }
+    return 0
+}
+
+fn cmd_variables(program: ref u8, fn_query: ref u8) i32 = trust {
+    val arena: allocators.Arena = allocators.Arena.new(64 * 1024 * 1024 as usize)?
+    val t_opt = load_target(arena, program)
+    val t: mut ref target.Target = none
+    match t_opt {
+        err e => {
+            stdio.print("phantom: {s}\n", {e})
+            return 1
+        }
+        ok tv => {
+            t = tv
+        }
+    }
+    for f in t.dwarf_info.functions {
+        if string.len_raw(fn_query) > 0 && !demangle.matches(f.name, fn_query) {
+            continue
+        }
+        stdio.print("{s} ({s})\n", {f.display, f.name})
+        for v in f.variables {
+            stdio.print("  {s}: {s} (file {s}:{lld})\n", {
+                v.source_name, type_name_of(t.dwarf_info, v.type_off), v.file, v.line
+            })
+        }
+    }
+    return 0
+}
+
+fn type_name_of(info: ref dwarf.DwarfInfo, off: u64) ref u8 = trust {
+    for t in info.types {
+        if t.offset == off {
+            if t.name != none && string.len_raw(t.name) > 0 {
+                return demangle.source_name(t.name)
+            }
+            if t.tag == 15 {
+                return @fmtalloc("{s} *", {type_name_of(info, t.type_off)})
+            }
+            if t.tag == 1 {
+                return @fmtalloc("{s}[{lld}]", {type_name_of(info, t.type_off), t.count})
+            }
+        }
+    }
+    return "?"
+}
+
+fn last_colon(s: ref u8) i64 = trust {
+    val n: i64 = string.len_raw(s)
+    val i: mut i64 = n - 1
+    for {
+        if i < 0 {
+            break
+        }
+        if @load8(@ptradd(s, i)) == 58 {
+            return i
+        }
+        i--
+    }
+    return -1
+}
+
+fn usage() void = trust {
+    stdio.puts("phantom - spectre debugger")
+    stdio.puts("")
+    stdio.puts("subcommands:")
+    stdio.puts("  debug <file.sx|binary> [options] [-- program args...]")
+    stdio.puts("  dap [options]")
+    stdio.puts("  build <file.sx> [-o <output>]")
+    stdio.puts("  symbols <binary> [query]")
+    stdio.puts("  lines <binary> [file:line]")
+    stdio.puts("  variables <binary> [function]")
+    stdio.puts("")
+    stdio.puts("options:")
+    stdio.puts("  --backend lldb|native   select backend (default: lldb)")
+    stdio.puts("  --compiler <path>       Spectre compiler used for .sx inputs")
+    stdio.puts("  -o <path>               output path for 'build'")
+    stdio.puts("  --program <path>        preset program for 'dap'")
+}
+
+/// Turn a source file into a debuggable binary when needed.
+fn prepare_program(
+    input: ref u8,
+    compiler: ref u8
+) result[ref u8, ref u8] = trust {
+    if string.raw_ends_with(input, ".sx") {
+        return build_source(compiler, input)
+    }
+    if !file_exists(input) {
+        return err @fmtalloc("'{s}' does not exist", {input})
+    }
+    return ok input
+}
+
+pub fn main() i32 = trust {
+    val args: list[ref u8] = os.get_args()
+    val argc: i64 = @len(args) as i64
+    if argc < 2 {
+        usage()
+        return 1
+    }
+    val first: ref u8 = arg_at(args, 1)
+    if string.str_eql(first, "help") || string.str_eql(first, "-h") ||
+    string.str_eql(first, "--help") {
+        usage()
+        return 0
+    }
+    if string.str_eql(first, "version") || string.str_eql(first, "-v") ||
+    string.str_eql(first, "--version") {
+        stdio.print("phantom {s}\n", {VERSION})
+        return 0
+    }
+
+    if string.str_eql(first, "symbols") {
+        if argc < 3 {
+            stdio.puts("usage: phantom symbols <binary> [query]")
+            return 1
+        }
+        return cmd_symbols(arg_at(args, 2), arg_at(args, 3))
+    }
+    if string.str_eql(first, "lines") {
+        if argc < 3 {
+            stdio.puts("usage: phantom lines <binary> [file:line]")
+            return 1
+        }
+        return cmd_lines(arg_at(args, 2), arg_at(args, 3))
+    }
+    if string.str_eql(first, "variables") {
+        if argc < 3 {
+            stdio.puts("usage: phantom variables <binary> [function]")
+            return 1
+        }
+        return cmd_variables(arg_at(args, 2), arg_at(args, 3))
+    }
+
+    if string.str_eql(first, "build") {
+        val source: ref u8 = arg_at(args, 2)
+        if string.len_raw(source) == 0 {
+            stdio.puts("usage: phantom build <file.sx> [-o <output>]")
+            return 1
+        }
+        val compiler: mut ref u8 = ""
+        val output: mut ref u8 = ""
+        val i: mut i64 = 3
+        for {
+            if i >= argc {
+                break
+            }
+            val a: ref u8 = arg_at(args, i)
+            if string.str_eql(a, "--compiler") {
+                i++
+                compiler = arg_at(args, i)
+            } elif string.str_eql(a, "-o") || string.str_eql(a, "--output") {
+                i++
+                output = arg_at(args, i)
+            }
+            i++
+        }
+        val comp: ref u8 = find_compiler(compiler)
+        if string.len_raw(output) > 0 {
+            val cmd: ref u8 = @fmtalloc(
+                "{s} {s} -alt -no-single-flags -o {s} 2>&1",
+                {comp, source, output}
+            )
+            val res = os.exec(cmd)
+            match res {
+                err e => {
+                    stdio.print("phantom: {s}\n", {e})
+                    return 1
+                }
+                ok text => {
+                    val out_text: ref u8 = string.cstr(text)
+                    if string.len_raw(out_text) > 0 {
+                        stdio.print("{s}\n", {out_text})
+                    }
+                    if file_exists(output) {
+                        stdio.print("Compiled: {s}\n", {output})
+                        return 0
+                    }
+                    return 1
+                }
+            }
+        }
+        val built = build_source(comp, source)
+        match built {
+            err e => {
+                stdio.print("phantom: {s}\n", {e})
+                return 1
+            }
+            ok out => {
+                stdio.print("Compiled: {s}\n", {out})
+                return 0
+            }
+        }
+    }
+
+    if string.str_eql(first, "debug") || string.str_eql(first, "dap") {
+        val is_dap: bool = string.str_eql(first, "dap")
+        val input: mut ref u8 = ""
+        val backend: mut ref u8 = "lldb"
+        val compiler: mut ref u8 = ""
+        val program_override: mut ref u8 = ""
+        val prog_args: mut list[ref u8] = @listalloc[allocators.HeapAllocator, ref u8](util.heap())?
+        val i: mut i64 = 2
+        if !is_dap {
+            input = arg_at(args, 2)
+            if string.len_raw(input) == 0 || string.raw_starts_with(input, "--") {
+                stdio.puts("usage: phantom debug <file.sx|binary> [options] [-- args...]")
+                return 1
+            }
+            i = 3
+        }
+        val saw_separator: mut bool = false
+        for {
+            if i >= argc {
+                break
+            }
+            val a: ref u8 = arg_at(args, i)
+            if saw_separator {
+                @append(prog_args, a)
+            } elif string.str_eql(a, "--") {
+                saw_separator = true
+            } elif string.str_eql(a, "-backend") || string.str_eql(a, "-b") {
+                i++
+                backend = arg_at(args, i)
+            } elif string.str_eql(a, "-compiler") {
+                i++
+                compiler = arg_at(args, i)
+            } elif string.str_eql(a, "-program") {
+                i++
+                program_override = arg_at(args, i)
+            } else {
+                if !is_dap {
+                    stdio.print("phantom: unknown option '{s}'\n", {a})
+                    return 1
+                }
+            }
+            i++
+        }
+        val comp: ref u8 = find_compiler(compiler)
+        if is_dap {
+            return dap.run(comp, backend, program_override, prog_args)
+        }
+        val prog = prepare_program(input, comp)
+        val program: mut ref u8 = ""
+        match prog {
+            err e => {
+                stdio.print("phantom: {s}\n", {e})
+                return 1
+            }
+            ok pv => {
+                program = pv
+            }
+        }
+        val arena: allocators.Arena = allocators.Arena.new(64 * 1024 * 1024 as usize)?
+        val t_opt = load_target(arena, program)
+        val t: mut ref target.Target = none
+        match t_opt {
+            err e => {
+                stdio.print("phantom: {s}\n", {e})
+                return 1
+            }
+            ok tv => {
+                t = tv
+            }
+        }
+        return cli.run(t, program, backend, prog_args)
+    }
+
+    stdio.print("phantom: unknown command '{s}'\n", {first})
+    usage()
+    return 1
+}
