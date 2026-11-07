@@ -53,8 +53,8 @@ generic_id<i32>
 ## DAP
 
 ```sh
-phantom-dev dap --backend native
-phantom-dev dap --backend lldb --program ./path/to/binary
+phantom-dev dap -backend native
+phantom-dev dap -backend lldb -program ./path/to/binary
 ```
 
 The server speaks DAP over stdin/stdout (`Content-Length` framing). A typical

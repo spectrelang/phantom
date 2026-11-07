@@ -250,10 +250,10 @@ fn usage() void = trust {
     stdio.puts("  variables <binary> [function]")
     stdio.puts("")
     stdio.puts("options:")
-    stdio.puts("  --backend lldb|native   select backend (default: lldb)")
-    stdio.puts("  --compiler <path>       Spectre compiler used for .sx inputs")
-    stdio.puts("  -o <path>               output path for 'build'")
-    stdio.puts("  --program <path>        preset program for 'dap'")
+    stdio.puts("  -backend lldb|native   select backend (default: lldb)")
+    stdio.puts("  -compiler <path>       spectre compiler used for .sx inputs")
+    stdio.puts("  -o <path>              output path for 'build'")
+    stdio.puts("  -program <path>        preset program for 'dap'")
 }
 
 /// Turn a source file into a debuggable binary when needed.
