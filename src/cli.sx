@@ -292,7 +292,102 @@ fn set_lldb_breakpoint(
     stdio.print("{s}\n", {out2})
 }
 
-fn run_lldb(t: ref target.Target, program: ref u8, startup_args: list[ref u8]) i32 = trust {
+fn exec_lldb_command(
+    s: mut ref lldb.LldbSession,
+    t: ref target.Target,
+    cmd: ref u8,
+    rest: ref u8,
+    watches: mut list[ref u8],
+    startup_args: list[ref u8]
+) bool = trust {
+    if string.str_eql(cmd, "quit") || string.str_eql(cmd, "q") || string.str_eql(cmd, "exit") {
+        lldb.quit(s)
+        return true
+    } elif string.str_eql(cmd, "help") || string.str_eql(cmd, "h") {
+        print_help()
+    } elif string.str_eql(cmd, "run") || string.str_eql(cmd, "r") {
+        val args: list[ref u8] = split_args(rest)
+        val final_args: mut list[ref u8] = args
+        if @len(args) == 0 {
+            final_args = startup_args
+        }
+        lldb.run(s, final_args)
+        print_lldb_stop(s)
+        print_watch_lldb(s, watches)
+    } elif string.str_eql(cmd, "continue") || string.str_eql(cmd, "c") {
+        lldb.cont(s)
+        print_lldb_stop(s)
+        print_watch_lldb(s, watches)
+    } elif string.str_eql(cmd, "next") || string.str_eql(cmd, "n") {
+        lldb.next(s)
+        print_lldb_stop(s)
+        print_watch_lldb(s, watches)
+    } elif string.str_eql(cmd, "step") || string.str_eql(cmd, "s") {
+        lldb.step(s)
+        print_lldb_stop(s)
+        print_watch_lldb(s, watches)
+    } elif string.str_eql(cmd, "finish") || string.str_eql(cmd, "f") {
+        lldb.finish(s)
+        print_lldb_stop(s)
+        print_watch_lldb(s, watches)
+    } elif string.str_eql(cmd, "break") || string.str_eql(cmd, "b") {
+        if string.len_raw(rest) > 0 {
+            set_lldb_breakpoint(s, t, rest)
+        }
+    } elif string.str_eql(cmd, "info") {
+        if string.raw_starts_with(rest, "break") || string.raw_starts_with(rest, "b") {
+            stdio.print("{s}\n", {lldb.clean_output(lldb.list_breakpoints(s))})
+        } else {
+            stdio.puts("usage: info break")
+        }
+    } elif string.str_eql(cmd, "delete") || string.str_eql(cmd, "d") {
+        val id_opt = util.parse_i64(rest)
+        if id_opt is some id {
+            stdio.print("{s}\n", {lldb.clean_output(lldb.delete_breakpoint(s, id))})
+        } else {
+            stdio.puts("usage: delete <id>")
+        }
+    } elif string.str_eql(cmd, "locals") || string.str_eql(cmd, "vars") || string.str_eql(cmd, "l") {
+        print_locals_lldb(s)
+    } elif string.str_eql(cmd, "print") || string.str_eql(cmd, "p") {
+        val expr: ref u8 = lldb.rewrite_expression(s, rest)
+        val out: ref u8 = lldb.clean_output(lldb.expression(s, expr))
+        stdio.print("{s}\n", {out})
+    } elif string.str_eql(cmd, "watch") {
+        if string.len_raw(rest) > 0 {
+            @append(watches, util.copy_cstr(rest))
+            print_watch_lldb(s, watches)
+        }
+    } elif string.str_eql(cmd, "unwatch") {
+        val idx_opt = util.parse_i64(rest)
+        if idx_opt is some idx {
+            val ii: i64 = idx
+            if ii > 0 && ii <= (@len(watches) as i64) {
+                @remove(watches, (ii - 1) as usize)
+            }
+        }
+    } elif string.str_eql(cmd, "backtrace") || string.str_eql(cmd, "bt") {
+        stdio.print("{s}\n", {lldb.clean_output(lldb.backtrace(s, 32))})
+    } elif string.str_eql(cmd, "list") {
+        val line_opt = util.parse_i64(rest)
+        if line_opt is some line {
+            stdio.print("{s}\n", {lldb.clean_output(lldb.source_line(s, line))})
+        } else {
+            stdio.print("{s}\n", {lldb.clean_output(lldb.source_line(s, 0))})
+        }
+    } else {
+        stdio.print("phantom: unknown command '{s}'\n", {cmd})
+    }
+    return false
+}
+
+fn run_lldb(
+    t: ref target.Target,
+    program: ref u8,
+    startup_args: list[ref u8],
+    batch: bool,
+    commands: list[ref u8]
+) i32 = trust {
     val s_opt = lldb.new("lldb", program)
     val s: mut ref lldb.LldbSession = none
     match s_opt {
@@ -305,6 +400,34 @@ fn run_lldb(t: ref target.Target, program: ref u8, startup_args: list[ref u8]) i
         }
     }
     val watches: mut list[ref u8] = @listalloc[allocators.HeapAllocator, ref u8](util.heap())?
+    if batch {
+        if (@len(commands) as i64) > 0 {
+            for line in commands {
+                if string.len_raw(line) == 0 {
+                    continue
+                }
+                val rest: mut ref u8 = ""
+                val cmd: ref u8 = split_word(line, @addr(rest))
+                if exec_lldb_command(s, t, cmd, rest, watches, startup_args) {
+                    break
+                }
+            }
+        } else {
+            for {
+                val line: ref u8 = read_command()
+                if string.len_raw(line) == 0 {
+                    break
+                }
+                val rest: mut ref u8 = ""
+                val cmd: ref u8 = split_word(line, @addr(rest))
+                if exec_lldb_command(s, t, cmd, rest, watches, startup_args) {
+                    break
+                }
+            }
+        }
+        lldb.quit(s)
+        return 0
+    }
     stdio.print("Phantom (LLDB backend) - {s}\n", {program})
     stdio.puts("Type 'help' for commands. 'run' starts the program.")
     for {
@@ -318,83 +441,8 @@ fn run_lldb(t: ref target.Target, program: ref u8, startup_args: list[ref u8]) i
         }
         val rest: mut ref u8 = ""
         val cmd: ref u8 = split_word(line, @addr(rest))
-        if string.str_eql(cmd, "quit") || string.str_eql(cmd, "q") || string.str_eql(cmd, "exit") {
-            lldb.quit(s)
+        if exec_lldb_command(s, t, cmd, rest, watches, startup_args) {
             break
-        } elif string.str_eql(cmd, "help") || string.str_eql(cmd, "h") {
-            print_help()
-        } elif string.str_eql(cmd, "run") || string.str_eql(cmd, "r") {
-            val args: list[ref u8] = split_args(rest)
-            val final_args: mut list[ref u8] = args
-            if @len(args) == 0 {
-                final_args = startup_args
-            }
-            lldb.run(s, final_args)
-            print_lldb_stop(s)
-            print_watch_lldb(s, watches)
-        } elif string.str_eql(cmd, "continue") || string.str_eql(cmd, "c") {
-            lldb.cont(s)
-            print_lldb_stop(s)
-            print_watch_lldb(s, watches)
-        } elif string.str_eql(cmd, "next") || string.str_eql(cmd, "n") {
-            lldb.next(s)
-            print_lldb_stop(s)
-            print_watch_lldb(s, watches)
-        } elif string.str_eql(cmd, "step") || string.str_eql(cmd, "s") {
-            lldb.step(s)
-            print_lldb_stop(s)
-            print_watch_lldb(s, watches)
-        } elif string.str_eql(cmd, "finish") || string.str_eql(cmd, "f") {
-            lldb.finish(s)
-            print_lldb_stop(s)
-            print_watch_lldb(s, watches)
-        } elif string.str_eql(cmd, "break") || string.str_eql(cmd, "b") {
-            if string.len_raw(rest) > 0 {
-                set_lldb_breakpoint(s, t, rest)
-            }
-        } elif string.str_eql(cmd, "info") {
-            if string.raw_starts_with(rest, "break") || string.raw_starts_with(rest, "b") {
-                stdio.print("{s}\n", {lldb.clean_output(lldb.list_breakpoints(s))})
-            } else {
-                stdio.puts("usage: info break")
-            }
-        } elif string.str_eql(cmd, "delete") || string.str_eql(cmd, "d") {
-            val id_opt = util.parse_i64(rest)
-            if id_opt is some id {
-                stdio.print("{s}\n", {lldb.clean_output(lldb.delete_breakpoint(s, id))})
-            } else {
-                stdio.puts("usage: delete <id>")
-            }
-        } elif string.str_eql(cmd, "locals") || string.str_eql(cmd, "vars") || string.str_eql(cmd, "l") {
-            print_locals_lldb(s)
-        } elif string.str_eql(cmd, "print") || string.str_eql(cmd, "p") {
-            val expr: ref u8 = lldb.rewrite_expression(s, rest)
-            val out: ref u8 = lldb.clean_output(lldb.expression(s, expr))
-            stdio.print("{s}\n", {out})
-        } elif string.str_eql(cmd, "watch") {
-            if string.len_raw(rest) > 0 {
-                @append(watches, util.copy_cstr(rest))
-                print_watch_lldb(s, watches)
-            }
-        } elif string.str_eql(cmd, "unwatch") {
-            val idx_opt = util.parse_i64(rest)
-            if idx_opt is some idx {
-                val ii: i64 = idx
-                if ii > 0 && ii <= (@len(watches) as i64) {
-                    @remove(watches, (ii - 1) as usize)
-                }
-            }
-        } elif string.str_eql(cmd, "backtrace") || string.str_eql(cmd, "bt") {
-            stdio.print("{s}\n", {lldb.clean_output(lldb.backtrace(s, 32))})
-        } elif string.str_eql(cmd, "list") {
-            val line_opt = util.parse_i64(rest)
-            if line_opt is some line {
-                stdio.print("{s}\n", {lldb.clean_output(lldb.source_line(s, line))})
-            } else {
-                stdio.print("{s}\n", {lldb.clean_output(lldb.source_line(s, 0))})
-            }
-        } else {
-            stdio.print("phantom: unknown command '{s}'\n", {cmd})
         }
     }
     return 0
@@ -429,7 +477,128 @@ fn split_args(rest: ref u8) list[ref u8] = trust {
     return out
 }
 
-fn run_native(program: ref u8, startup_args: list[ref u8]) i32 = trust {
+fn exec_native_command(
+    s: mut ref native.NativeSession,
+    cmd: ref u8,
+    rest: ref u8,
+    watches: mut list[ref u8],
+    startup_args: list[ref u8]
+) bool = trust {
+    if string.str_eql(cmd, "quit") || string.str_eql(cmd, "q") || string.str_eql(cmd, "exit") {
+        native.quit(s)
+        return true
+    } elif string.str_eql(cmd, "help") || string.str_eql(cmd, "h") {
+        print_help()
+    } elif string.str_eql(cmd, "run") || string.str_eql(cmd, "r") {
+        if s.started && !s.exited {
+            native.cont(s)
+        } else {
+            val args: list[ref u8] = split_args(rest)
+            val final_args: mut list[ref u8] = args
+            if @len(args) == 0 {
+                final_args = startup_args
+            }
+            val lr = native.launch(s, final_args)
+            match lr {
+                err e => {
+                    stdio.print("phantom: {s}\n", {e})
+                    return false
+                }
+                ok _ => {
+                    native.cont(s)
+                }
+            }
+        }
+        print_native_stop(s)
+        print_watch_native(s, watches)
+    } elif string.str_eql(cmd, "continue") || string.str_eql(cmd, "c") {
+        val cr = native.cont(s)
+        match cr {
+            err e => {
+                stdio.print("phantom: {s}\n", {e})
+                return false
+            }
+            ok _ => {
+                print_native_stop(s)
+                print_watch_native(s, watches)
+            }
+        }
+    } elif string.str_eql(cmd, "next") || string.str_eql(cmd, "n") ||
+    string.str_eql(cmd, "step") || string.str_eql(cmd, "s") ||
+    string.str_eql(cmd, "finish") || string.str_eql(cmd, "f") {
+        stdio.puts("phantom: source-level stepping is not implemented in the native backend yet; use the LLDB backend for now.")
+    } elif string.str_eql(cmd, "break") || string.str_eql(cmd, "b") {
+        if string.len_raw(rest) > 0 {
+            val addr_opt = native.resolve_breakpoint(s, rest)
+            if addr_opt is some addr {
+                val id: i64 = native.add_breakpoint(s, addr, rest, "source")
+                stdio.print("Breakpoint {lld}: {s} at 0x{x}\n", {id, rest, addr})
+            } else {
+                stdio.print("phantom: no breakpoint location matching '{s}'\n", {rest})
+            }
+        }
+    } elif string.str_eql(cmd, "info") {
+        if string.raw_starts_with(rest, "break") || string.raw_starts_with(rest, "b") {
+            stdio.print("{s}", {native.list_breakpoints(s)})
+        } else {
+            stdio.puts("usage: info break")
+        }
+    } elif string.str_eql(cmd, "delete") || string.str_eql(cmd, "d") {
+        val id_opt = util.parse_i64(rest)
+        if id_opt is some id {
+            if native.delete_breakpoint(s, id) {
+                stdio.print("Deleted breakpoint {lld}\n", {id})
+            } else {
+                stdio.print("phantom: no breakpoint {lld}\n", {id})
+            }
+        } else {
+            stdio.puts("usage: delete <id>")
+        }
+    } elif string.str_eql(cmd, "locals") || string.str_eql(cmd, "vars") || string.str_eql(cmd, "l") {
+        stdio.print("{s}", {native.locals(s)})
+    } elif string.str_eql(cmd, "print") || string.str_eql(cmd, "p") {
+        val out: ref u8 = native.read_expression(s, rest)
+        if string.len_raw(out) == 0 {
+            stdio.puts("phantom: cannot evaluate expression")
+        } else {
+            stdio.print("{s}\n", {out})
+        }
+    } elif string.str_eql(cmd, "watch") {
+        if string.len_raw(rest) > 0 {
+            @append(watches, util.copy_cstr(rest))
+            print_watch_native(s, watches)
+        }
+    } elif string.str_eql(cmd, "unwatch") {
+        val idx_opt = util.parse_i64(rest)
+        if idx_opt is some idx {
+            val ii: i64 = idx
+            if ii > 0 && ii <= (@len(watches) as i64) {
+                @remove(watches, (ii - 1) as usize)
+            }
+        }
+    } elif string.str_eql(cmd, "backtrace") || string.str_eql(cmd, "bt") {
+        stdio.print("{s}", {native.backtrace(s)})
+    } elif string.str_eql(cmd, "list") {
+        val loc: ref u8 = native.current_location(s)
+        val colon: i64 = last_colon(loc)
+        if colon > 0 {
+            val line_opt = util.parse_i64(@ptradd(loc, colon + 1))
+            if line_opt is some line {
+                print_source_at(util.copy_cstr_len(loc, colon), line)
+            }
+        }
+    } else {
+        stdio.print("phantom: unknown command '{s}'\n", {cmd})
+    }
+    return false
+}
+
+fn run_native(
+    program: ref u8,
+    startup_args: list[ref u8],
+    batch: bool,
+    commands: list[ref u8]
+) i32 = trust {
     val arena: allocators.Arena = allocators.Arena.new(64 * 1024 * 1024 as usize)?
     val n_opt = native.load(arena, program)
     val s: mut ref native.NativeSession = none
@@ -443,6 +612,34 @@ fn run_native(program: ref u8, startup_args: list[ref u8]) i32 = trust {
         }
     }
     val watches: mut list[ref u8] = @listalloc[allocators.HeapAllocator, ref u8](util.heap())?
+    if batch {
+        if (@len(commands) as i64) > 0 {
+            for line in commands {
+                if string.len_raw(line) == 0 {
+                    continue
+                }
+                val rest: mut ref u8 = ""
+                val cmd: ref u8 = split_word(line, @addr(rest))
+                if exec_native_command(s, cmd, rest, watches, startup_args) {
+                    break
+                }
+            }
+        } else {
+            for {
+                val line: ref u8 = read_command()
+                if string.len_raw(line) == 0 {
+                    break
+                }
+                val rest: mut ref u8 = ""
+                val cmd: ref u8 = split_word(line, @addr(rest))
+                if exec_native_command(s, cmd, rest, watches, startup_args) {
+                    break
+                }
+            }
+        }
+        native.quit(s)
+        return 0
+    }
     stdio.print("Phantom (native DWARF/ptrace backend) - {s}\n", {program})
     stdio.puts("Type 'help' for commands. Stepping is currently LLDB-only.")
     for {
@@ -456,121 +653,25 @@ fn run_native(program: ref u8, startup_args: list[ref u8]) i32 = trust {
         }
         val rest: mut ref u8 = ""
         val cmd: ref u8 = split_word(line, @addr(rest))
-        if string.str_eql(cmd, "quit") || string.str_eql(cmd, "q") || string.str_eql(cmd, "exit") {
-            native.quit(s)
+        if exec_native_command(s, cmd, rest, watches, startup_args) {
             break
-        } elif string.str_eql(cmd, "help") || string.str_eql(cmd, "h") {
-            print_help()
-        } elif string.str_eql(cmd, "run") || string.str_eql(cmd, "r") {
-            if s.started && !s.exited {
-                native.cont(s)
-            } else {
-                val args: list[ref u8] = split_args(rest)
-                val final_args: mut list[ref u8] = args
-                if @len(args) == 0 {
-                    final_args = startup_args
-                }
-                val lr = native.launch(s, final_args)
-                match lr {
-                    err e => {
-                        stdio.print("phantom: {s}\n", {e})
-                        continue
-                    }
-                    ok _ => {
-                        native.cont(s)
-                    }
-                }
-            }
-            print_native_stop(s)
-            print_watch_native(s, watches)
-        } elif string.str_eql(cmd, "continue") || string.str_eql(cmd, "c") {
-            val cr = native.cont(s)
-            match cr {
-                err e => {
-                    stdio.print("phantom: {s}\n", {e})
-                    continue
-                }
-                ok _ => {
-                    print_native_stop(s)
-                    print_watch_native(s, watches)
-                }
-            }
-        } elif string.str_eql(cmd, "next") || string.str_eql(cmd, "n") ||
-        string.str_eql(cmd, "step") || string.str_eql(cmd, "s") ||
-        string.str_eql(cmd, "finish") || string.str_eql(cmd, "f") {
-            stdio.puts("phantom: source-level stepping is not implemented in the native backend yet; use the LLDB backend for now.")
-        } elif string.str_eql(cmd, "break") || string.str_eql(cmd, "b") {
-            if string.len_raw(rest) > 0 {
-                val addr_opt = native.resolve_breakpoint(s, rest)
-                if addr_opt is some addr {
-                    val id: i64 = native.add_breakpoint(s, addr, rest, "source")
-                    stdio.print("Breakpoint {lld}: {s} at 0x{x}\n", {id, rest, addr})
-                } else {
-                    stdio.print("phantom: no breakpoint location matching '{s}'\n", {rest})
-                }
-            }
-        } elif string.str_eql(cmd, "info") {
-            if string.raw_starts_with(rest, "break") || string.raw_starts_with(rest, "b") {
-                stdio.print("{s}", {native.list_breakpoints(s)})
-            } else {
-                stdio.puts("usage: info break")
-            }
-        } elif string.str_eql(cmd, "delete") || string.str_eql(cmd, "d") {
-            val id_opt = util.parse_i64(rest)
-            if id_opt is some id {
-                if native.delete_breakpoint(s, id) {
-                    stdio.print("Deleted breakpoint {lld}\n", {id})
-                } else {
-                    stdio.print("phantom: no breakpoint {lld}\n", {id})
-                }
-            } else {
-                stdio.puts("usage: delete <id>")
-            }
-        } elif string.str_eql(cmd, "locals") || string.str_eql(cmd, "vars") || string.str_eql(cmd, "l") {
-            stdio.print("{s}", {native.locals(s)})
-        } elif string.str_eql(cmd, "print") || string.str_eql(cmd, "p") {
-            val out: ref u8 = native.read_expression(s, rest)
-            if string.len_raw(out) == 0 {
-                stdio.puts("phantom: cannot evaluate expression")
-            } else {
-                stdio.print("{s}\n", {out})
-            }
-        } elif string.str_eql(cmd, "watch") {
-            if string.len_raw(rest) > 0 {
-                @append(watches, util.copy_cstr(rest))
-                print_watch_native(s, watches)
-            }
-        } elif string.str_eql(cmd, "unwatch") {
-            val idx_opt = util.parse_i64(rest)
-            if idx_opt is some idx {
-                val ii: i64 = idx
-                if ii > 0 && ii <= (@len(watches) as i64) {
-                    @remove(watches, (ii - 1) as usize)
-                }
-            }
-        } elif string.str_eql(cmd, "backtrace") || string.str_eql(cmd, "bt") {
-            stdio.print("{s}", {native.backtrace(s)})
-        } elif string.str_eql(cmd, "list") {
-            val loc: ref u8 = native.current_location(s)
-            val colon: i64 = last_colon(loc)
-            if colon > 0 {
-                val line_opt = util.parse_i64(@ptradd(loc, colon + 1))
-                if line_opt is some line {
-                    print_source_at(util.copy_cstr_len(loc, colon), line)
-                }
-            }
-        } else {
-            stdio.print("phantom: unknown command '{s}'\n", {cmd})
         }
     }
     return 0
 }
 
-/// Run the interactive debugger.
-pub fn run(t: ref target.Target, program: ref u8, backend: ref u8, args: list[ref u8]) i32 = trust {
+/// Run the interactive debugger or a non-interactive batch of commands.
+pub fn run(
+    t: ref target.Target,
+    program: ref u8,
+    backend: ref u8,
+    args: list[ref u8],
+    batch: bool,
+    commands: list[ref u8]
+) i32 = trust {
     if string.str_eql(backend, "native") || string.str_eql(backend, "dwarf") ||
     string.str_eql(backend, "ptrace") {
-        return run_native(program, args)
+        return run_native(program, args, batch, commands)
     }
-    return run_lldb(t, program, args)
+    return run_lldb(t, program, args, batch, commands)
 }

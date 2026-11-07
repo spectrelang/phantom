@@ -340,3 +340,38 @@ pub fn matches(sym: ref u8, query: ref u8) bool = trust {
     }
     return false
 }
+
+test "demangles modules with dots and generics with brackets" {
+    trust {
+        assert string.str_eql(pretty("std__stdio__print"), "std.stdio.print")
+        assert string.str_eql(pretty("sx__sx__identity__GENMONO__i64"), "identity[i64]")
+        assert string.str_eql(
+            pretty("std__fmt__render__GENMONO__i32__ref_u8"),
+            "std.fmt.render[i32, ref u8]"
+        )
+    }
+}
+
+test "labels the spectre runtime init" {
+    trust {
+        assert string.str_eql(pretty("sx__init"), "[spectre runtime init]")
+    }
+}
+
+test "matches current and legacy symbol spellings" {
+    trust {
+        assert matches("std__stdio__print", "std.stdio.print")
+        assert matches("std__stdio__print", "std::stdio::print")
+        assert matches("sx__sx__identity__GENMONO__i64", "identity[i64]")
+        assert matches("sx__sx__identity__GENMONO__i64", "identity<i64>")
+        assert !matches("std__stdio__print", "nope")
+    }
+}
+
+test "strips compiler prefixes from source names" {
+    trust {
+        assert string.str_eql(source_name("t_sum"), "sum")
+        assert string.str_eql(source_name("sx__count"), "count")
+        assert string.str_eql(short_name("std__stdio__print"), "print")
+    }
+}

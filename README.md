@@ -13,6 +13,20 @@ phantom debug ./path/to/binary -backend native -- arg1 arg2
 A `.sx` input is compiled automatically with the ALT backend. Use
 `-compiler <path>` or `PHANTOM_COMPILER` to select the Spectre compiler.
 
+### Batch mode
+
+Run commands without entering the interactive prompt:
+
+```sh
+phantom debug ./path/to/binary -batch -ex 'break main' -ex run -ex backtrace
+phantom debug ./path/to/binary -batch -x commands.txt
+printf 'run\nbacktrace\n' | phantom debug ./path/to/binary -batch
+```
+
+Command files contain one debugger command per line; blank lines and lines
+starting with `#` are ignored. Batch mode suppresses the banner and prompt and
+exits when the commands finish.
+
 The interactive commands include:
 
 ```text

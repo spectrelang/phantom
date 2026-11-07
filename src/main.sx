@@ -6,6 +6,7 @@
 val stdio      = use("std/stdio")
 val string     = use("std/string")
 val os         = use("std/os")
+val fs         = use("std/fs")
 val allocators = use("std/allocators")
 val util       = use("util.sx")
 val target     = use("target.sx")
@@ -399,6 +400,9 @@ fn usage() void = trust {
     stdio.puts("options:")
     stdio.puts("  -backend lldb|native   select backend (default: lldb)")
     stdio.puts("  -compiler <path>       spectre compiler used for .sx inputs")
+    stdio.puts("  -batch, --batch        run commands non-interactively, then exit")
+    stdio.puts("  -ex, --eval-command <cmd>  execute one command (repeatable)")
+    stdio.puts("  -x, --command <file>   execute commands from a file (repeatable)")
     stdio.puts("  -o <path>              output path for 'build'")
     stdio.puts("  -program <path>        preset program for 'dap'")
 }
@@ -415,6 +419,72 @@ fn prepare_program(
         return err @fmtalloc("'{s}' does not exist", {input})
     }
     return ok input
+}
+
+fn batch_trim(s: ref u8) ref u8 = trust {
+    if s == none {
+        return ""
+    }
+    val n: i64 = string.len_raw(s)
+    val start: mut i64 = 0
+    for {
+        if start >= n {
+            break
+        }
+        val c: u8 = @load8(@ptradd(s, start))
+        if c == 32 || c == 9 || c == 13 {
+            start++
+        } else {
+            break
+        }
+    }
+    val end: mut i64 = n
+    for {
+        if end <= start {
+            break
+        }
+        val c: u8 = @load8(@ptradd(s, end - 1))
+        if c == 32 || c == 9 || c == 13 {
+            end--
+        } else {
+            break
+        }
+    }
+    return util.copy_cstr_len(@ptradd(s, start), end - start)
+}
+
+fn batch_add_text(commands: mut list[ref u8], text: ref u8) void = trust {
+    if text == none {
+        return
+    }
+    val n: i64 = string.len_raw(text)
+    val pos: mut i64 = 0
+    for {
+        if pos >= n {
+            break
+        }
+        val end: mut i64 = pos
+        for {
+            if end >= n || @load8(@ptradd(text, end)) == 10 {
+                break
+            }
+            end++
+        }
+        val line: ref u8 = batch_trim(util.copy_cstr_len(@ptradd(text, pos), end - pos))
+        if string.len_raw(line) > 0 && @load8(line) != 35 {
+            @append(commands, line)
+        }
+        pos = end + 1
+    }
+}
+
+fn batch_add_file(commands: mut list[ref u8], path: ref u8) bool = trust {
+    val data_opt = fs.read_all_raw(path)
+    if data_opt is some dv {
+        batch_add_text(commands, dv as ref u8)
+        return true
+    }
+    return false
 }
 
 pub fn main() i32 = trust {
@@ -526,6 +596,8 @@ pub fn main() i32 = trust {
         val compiler: mut ref u8 = ""
         val program_override: mut ref u8 = ""
         val prog_args: mut list[ref u8] = @listalloc[allocators.HeapAllocator, ref u8](util.heap())?
+        val batch: mut bool = false
+        val batch_commands: mut list[ref u8] = @listalloc[allocators.HeapAllocator, ref u8](util.heap())?
         val i: mut i64 = 2
         if !is_dap {
             input = arg_at(args, 2)
@@ -554,6 +626,34 @@ pub fn main() i32 = trust {
             } elif string.str_eql(a, "-program") {
                 i++
                 program_override = arg_at(args, i)
+            } elif string.str_eql(a, "-batch") || string.str_eql(a, "--batch") {
+                batch = true
+            } elif string.str_eql(a, "-ex") || string.str_eql(a, "--eval-command") {
+                i++
+                val command: ref u8 = batch_trim(arg_at(args, i))
+                if string.len_raw(command) > 0 {
+                    @append(batch_commands, command)
+                }
+            } elif string.raw_starts_with(a, "--eval-command=") {
+                val command: ref u8 = batch_trim(
+                    @ptradd(a, string.len_raw("--eval-command="))
+                )
+                if string.len_raw(command) > 0 {
+                    @append(batch_commands, command)
+                }
+            } elif string.str_eql(a, "-x") || string.str_eql(a, "--command") {
+                i++
+                val path: ref u8 = arg_at(args, i)
+                if !batch_add_file(batch_commands, path) {
+                    stdio.print("phantom: cannot read command file '{s}'\n", {path})
+                    return 1
+                }
+            } elif string.raw_starts_with(a, "--command=") {
+                val path: ref u8 = @ptradd(a, string.len_raw("--command="))
+                if !batch_add_file(batch_commands, path) {
+                    stdio.print("phantom: cannot read command file '{s}'\n", {path})
+                    return 1
+                }
             } else {
                 if !is_dap {
                     stdio.print("phantom: unknown option '{s}'\n", {a})
@@ -589,10 +689,43 @@ pub fn main() i32 = trust {
                 t = tv
             }
         }
-        return cli.run(t, program, backend, prog_args)
+        return cli.run(t, program, backend, prog_args, batch, batch_commands)
     }
 
     stdio.print("phantom: unknown command '{s}'\n", {first})
     usage()
     return 1
+}
+
+test "batch commands trim whitespace and skip comments" {
+    trust {
+        val commands: mut list[ref u8] = @listalloc[allocators.HeapAllocator, ref u8](util.heap())?
+        batch_add_text(commands, "# comment\n\n  break main \t\nrun\n")
+        assert (@len(commands) as i64) == 2
+        val first = @get(commands, 0)
+        match first {
+            some v => {
+                assert string.str_eql(v as ref u8, "break main")
+            }
+            none => {
+                assert false
+            }
+        }
+        val second = @get(commands, 1)
+        match second {
+            some v => {
+                assert string.str_eql(v as ref u8, "run")
+            }
+            none => {
+                assert false
+            }
+        }
+    }
+}
+
+test "batch trim handles empty and padded input" {
+    trust {
+        assert string.str_eql(batch_trim("   "), "")
+        assert string.str_eql(batch_trim("  next  "), "next")
+    }
 }

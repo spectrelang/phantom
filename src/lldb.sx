@@ -651,3 +651,11 @@ pub fn rewrite_expression(s: mut ref LldbSession, expr: ref u8) ref u8 = trust {
     @store8(@ptradd(out, oi), 0)
     return out
 }
+
+test "hex encoding roundtrips lldb command text" {
+    trust {
+        assert string.str_eql(hex_encode("abc"), "616263")
+        assert string.str_eql(hex_encode(""), "")
+        assert string.str_eql(hex_encode("a b'c"), "6120622763")
+    }
+}
