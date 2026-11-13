@@ -5,6 +5,7 @@
 /// SPDX-License-Identifier: GPL-3.0-only
 
 val string     = use("std/string")
+val builder    = use("std/string/builder")
 val allocators = use("std/allocators")
 val util       = use("util.sx")
 val elf        = use("elf.sx")
@@ -613,19 +614,19 @@ pub fn delete_breakpoint(s: mut ref NativeSession, id: i64) bool = trust {
 
 /// List breakpoints as a human-readable string.
 pub fn list_breakpoints(s: ref NativeSession) ref u8 = trust {
-    val sb: ref void = string.StringBuilder.new()
+    val sb: ref void = builder.StringBuilder.new()
     for bp in s.breakpoints {
-        val suffix: mut ref u8 = ""
+        val suffix: mut ref u8 = c""
         if !bp.enabled {
-            suffix = " (disabled)"
+            suffix = c" (disabled)"
         }
-        string.StringBuilder.append_cstr(sb, @fmtalloc("Breakpoint {lld}: {s} at 0x{x}{s}\n", {
+        builder.StringBuilder.append_cstr(sb, @fmtalloc("Breakpoint {lld}: {s} at 0x{x}{s}\n", {
             bp.id, bp.kind, bp.address + s.bias, suffix
         }))
     }
-    val built: string.String = string.StringBuilder.build(sb)
-    val out: ref u8 = util.copy_cstr(string.cstr(built))
-    string.StringBuilder.free(sb)
+    val built: string.String = builder.StringBuilder.build(sb)
+    val out: ref u8 = util.copy_cstr[ref u8](built.ptr)
+    builder.StringBuilder.free(sb)
     return out
 }
 
@@ -634,7 +635,7 @@ pub fn resolve_breakpoint(s: NativeSession, query: ref u8) option[u64] = trust {
     val colon: i64 = last_colon(query)
     if colon > 0 {
         val file: ref u8 = util.copy_cstr_len(query, colon)
-        val line_opt = util.parse_i64(@ptradd(query, colon + 1))
+        val line_opt = util.parse_i64[ref u8](@ptradd(query, colon + 1))
         if line_opt is some line {
             val addr_opt = dwarf.address_for_line(s.dwarf_info, file, line)
             if addr_opt is some addr {
@@ -667,7 +668,7 @@ pub fn resolve_breakpoint(s: NativeSession, query: ref u8) option[u64] = trust {
 }
 
 fn last_colon(query: ref u8) i64 = trust {
-    val n: i64 = string.len_raw(query)
+    val n: i64 = util.len_raw[_](query)
     val i: mut i64 = n - 1
     for {
         if i < 0 {
@@ -684,7 +685,7 @@ fn last_colon(query: ref u8) i64 = trust {
 /// Return a display name for a DWARF type offset.
 pub fn type_name(s: ref NativeSession, off: u64) ref u8 = trust {
     if s == none || s.dwarf_info == none {
-        return "?"
+        return c"?"
     }
     return type_display(s.dwarf_info, off)
 }
@@ -693,29 +694,29 @@ pub fn type_name(s: ref NativeSession, off: u64) ref u8 = trust {
 /// rows.
 pub fn locals(s: ref NativeSession) ref u8 = trust {
     if s == none || !s.stopped || s.current_function == none {
-        return ""
+        return c""
     }
-    val sb: ref void = string.StringBuilder.new()
+    val sb: ref void = builder.StringBuilder.new()
     for v in s.current_function.variables {
         val val_str: ref u8 = render_variable(s, v)
-        string.StringBuilder.append_cstr(sb, @fmtalloc("({s}) {s} = {s}\n", {
+        builder.StringBuilder.append_cstr(sb, @fmtalloc("({s}) {s} = {s}\n", {
             type_display(s.dwarf_info, v.type_off), v.source_name, val_str
         }))
     }
-    val built: string.String = string.StringBuilder.build(sb)
-    val out: ref u8 = util.copy_cstr(string.cstr(built))
-    string.StringBuilder.free(sb)
+    val built: string.String = builder.StringBuilder.build(sb)
+    val out: ref u8 = util.copy_cstr[ref u8](built.ptr)
+    builder.StringBuilder.free(sb)
     return out
 }
 
 /// Read one variable by source name or raw name.
 pub fn read_variable(s: ref NativeSession, name: ref u8) ref u8 = trust {
     if s == none || !s.stopped || s.current_function == none {
-        return ""
+        return c""
     }
     val v: ref dwarf.DwarfVariable = dwarf.find_variable(s.current_function, name)
     if v == none {
-        return ""
+        return c""
     }
     return render_variable(s, v)
 }
@@ -723,11 +724,11 @@ pub fn read_variable(s: ref NativeSession, name: ref u8) ref u8 = trust {
 
 fn render_variable(s: ref NativeSession, v: ref dwarf.DwarfVariable) ref u8 = trust {
     if v.loc_len == 0 {
-        return "<optimized out>"
+        return c"<optimized out>"
     }
     val er: EvalResult = eval_expr(s, v.loc_off, v.loc_len)
     if !er.success {
-        return "<unavailable>"
+        return c"<unavailable>"
     }
     if er.is_value {
         return format_scalar(s.dwarf_info, v.type_off, er.value)
@@ -758,9 +759,9 @@ fn unwrap_type(info: ref dwarf.DwarfInfo, off_in: u64) ref dwarf.DwarfType = tru
 fn type_display(info: ref dwarf.DwarfInfo, off: u64) ref u8 = trust {
     val t: ref dwarf.DwarfType = type_at(info, off)
     if t == none {
-        return "?"
+        return c"?"
     }
-    if t.name != none && string.len_raw(t.name) > 0 {
+    if t.name != none && util.len_or_zero(t.name) > 0 {
         return demangle.source_name(t.name)
     }
     if t.tag == 15 {
@@ -769,7 +770,7 @@ fn type_display(info: ref dwarf.DwarfInfo, off: u64) ref u8 = trust {
     if t.tag == 1 {
         return @fmtalloc("{s}[{lld}]", {type_display(info, t.type_off), t.count})
     }
-    return "?"
+    return c"?"
 }
 
 fn type_size(info: ref dwarf.DwarfInfo, off: u64) i64 = trust {
@@ -837,7 +838,7 @@ fn format_scalar(info: ref dwarf.DwarfInfo, off: u64, value: u64) ref u8 = trust
 
 fn render_value(s: ref NativeSession, off: u64, addr: u64, depth: i64) ref u8 = trust {
     if depth > 3 {
-        return "..."
+        return c"..."
     }
     val info: ref dwarf.DwarfInfo = s.dwarf_info
     val t: ref dwarf.DwarfType = unwrap_type(info, off)
@@ -850,46 +851,46 @@ fn render_value(s: ref NativeSession, off: u64, addr: u64, depth: i64) ref u8 = 
     if t.tag == 1 {
         val count: i64 = t.count
         val inner_sz: i64 = type_size(info, t.type_off)
-        val sb: ref void = string.StringBuilder.new()
-        string.StringBuilder.append_cstr(sb, "[")
+        val sb: ref void = builder.StringBuilder.new()
+        builder.StringBuilder.append_cstr(sb, c"[")
         val i: mut i64 = 0
         for {
             if i >= count || i >= 16 {
                 break
             }
             if i > 0 {
-                string.StringBuilder.append_cstr(sb, ", ")
+                builder.StringBuilder.append_cstr(sb, c", ")
             }
             val elem_addr: u64 = addr + (i * inner_sz) as u64
-            string.StringBuilder.append_cstr(sb, render_value(s, t.type_off, elem_addr, depth + 1))
+            builder.StringBuilder.append_cstr(sb, render_value(s, t.type_off, elem_addr, depth + 1))
             i++
         }
         if count > 16 {
-            string.StringBuilder.append_cstr(sb, ", ...")
+            builder.StringBuilder.append_cstr(sb, c", ...")
         }
-        string.StringBuilder.append_cstr(sb, "]")
-        val built: string.String = string.StringBuilder.build(sb)
-        val out: ref u8 = util.copy_cstr(string.cstr(built))
-        string.StringBuilder.free(sb)
+        builder.StringBuilder.append_cstr(sb, c"]")
+        val built: string.String = builder.StringBuilder.build(sb)
+        val out: ref u8 = util.copy_cstr[ref u8](built.ptr)
+        builder.StringBuilder.free(sb)
         return out
     }
     if t.tag == 19 || t.tag == 23 {
-        val sb: ref void = string.StringBuilder.new()
-        string.StringBuilder.append_cstr(sb, "{")
+        val sb: ref void = builder.StringBuilder.new()
+        builder.StringBuilder.append_cstr(sb, c"{")
         val first: mut bool = true
         for m in t.members {
             if !first {
-                string.StringBuilder.append_cstr(sb, ", ")
+                builder.StringBuilder.append_cstr(sb, c", ")
             }
             first = false
-            string.StringBuilder.append_cstr(sb, m.name)
-            string.StringBuilder.append_cstr(sb, " = ")
-            string.StringBuilder.append_cstr(sb, render_value(s, m.type_off, addr + m.offset, depth + 1))
+            builder.StringBuilder.append_cstr(sb, m.name)
+            builder.StringBuilder.append_cstr(sb, c" = ")
+            builder.StringBuilder.append_cstr(sb, render_value(s, m.type_off, addr + m.offset, depth + 1))
         }
-        string.StringBuilder.append_cstr(sb, "}")
-        val built2: string.String = string.StringBuilder.build(sb)
-        val out2: ref u8 = util.copy_cstr(string.cstr(built2))
-        string.StringBuilder.free(sb)
+        builder.StringBuilder.append_cstr(sb, c"}")
+        val built2: string.String = builder.StringBuilder.build(sb)
+        val out2: ref u8 = util.copy_cstr[ref u8](built2.ptr)
+        builder.StringBuilder.free(sb)
         return out2
     }
     val sz: i64 = type_size(info, off)
@@ -1188,11 +1189,11 @@ pub fn eval_expr(
 /// Return the current source location as `file:line`, or empty.
 pub fn current_location(s: ref NativeSession) ref u8 = trust {
     if s == none || !s.stopped || s.dwarf_info == none {
-        return ""
+        return c""
     }
     val row: ref dwarf.DwarfLineRow = dwarf.line_for_pc(s.dwarf_info, s.regs.rip - s.bias)
-    if row == none || string.len_raw(row.file) == 0 {
-        return ""
+    if row == none || util.len_or_zero(row.file) == 0 {
+        return c""
     }
     return @fmtalloc("{s}:{lld}", {row.file, row.line})
 }
@@ -1200,7 +1201,7 @@ pub fn current_location(s: ref NativeSession) ref u8 = trust {
 /// Return the current function's display name.
 pub fn current_function_name(s: ref NativeSession) ref u8 = trust {
     if s == none {
-        return ""
+        return c""
     }
     if s.current_function != none {
         return s.current_function.display
@@ -1215,7 +1216,7 @@ pub fn current_function_name(s: ref NativeSession) ref u8 = trust {
 /// Backtrace is intentionally shallow for the native backend: one frame from
 /// DWARF line info plus a frame-pointer chain when available.
 pub fn backtrace(s: ref NativeSession) ref u8 = trust {
-    val sb: ref void = string.StringBuilder.new()
+    val sb: ref void = builder.StringBuilder.new()
     val pc: mut u64 = s.regs.rip - s.bias
     val fp: mut u64 = s.regs.rbp
     val depth: mut i64 = 0
@@ -1225,7 +1226,7 @@ pub fn backtrace(s: ref NativeSession) ref u8 = trust {
         }
         val f: ref dwarf.DwarfFunction = dwarf.function_for_pc(s.dwarf_info, pc)
         val name: mut ref u8 = @fmtalloc("0x{x}", {pc})
-        val file: mut ref u8 = ""
+        val file: mut ref u8 = c""
         val line: mut i64 = 0
         if f != none {
             name = f.display
@@ -1240,10 +1241,10 @@ pub fn backtrace(s: ref NativeSession) ref u8 = trust {
                 name = demangle.pretty(sym.name)
             }
         }
-        if string.len_raw(file) > 0 {
-            string.StringBuilder.append_cstr(sb, @fmtalloc("frame #{lld}: {s} at {s}:{lld}\n", {depth, name, file, line}))
+        if util.len_or_zero(file) > 0 {
+            builder.StringBuilder.append_cstr(sb, @fmtalloc("frame #{lld}: {s} at {s}:{lld}\n", {depth, name, file, line}))
         } else {
-            string.StringBuilder.append_cstr(sb, @fmtalloc("frame #{lld}: {s}\n", {depth, name}))
+            builder.StringBuilder.append_cstr(sb, @fmtalloc("frame #{lld}: {s}\n", {depth, name}))
         }
         if fp == 0 {
             break
@@ -1257,18 +1258,18 @@ pub fn backtrace(s: ref NativeSession) ref u8 = trust {
         fp = next_fp
         depth++
     }
-    val built: string.String = string.StringBuilder.build(sb)
-    val out: ref u8 = util.copy_cstr(string.cstr(built))
-    string.StringBuilder.free(sb)
+    val built: string.String = builder.StringBuilder.build(sb)
+    val out: ref u8 = util.copy_cstr[ref u8](built.ptr)
+    builder.StringBuilder.free(sb)
     return out
 }
 
 
 fn trim_raw(s: ref u8) ref u8 = trust {
     if s == none {
-        return ""
+        return c""
     }
-    val n: i64 = string.len_raw(s)
+    val n: i64 = util.len_raw[_](s)
     val start: mut i64 = 0
     val end: mut i64 = n
     for {
@@ -1299,7 +1300,7 @@ fn member_named(t: ref dwarf.DwarfType, name: ref u8) ref dwarf.DwarfMember = tr
         return none
     }
     for m in t.members {
-        if string.str_eql(m.name, name) {
+        if util.eq[ref u8, ref u8](m.name, name) {
             return m
         }
     }
@@ -1310,12 +1311,12 @@ fn member_named(t: ref dwarf.DwarfType, name: ref u8) ref dwarf.DwarfMember = tr
 /// More complex expressions are intentionally left to the LLDB backend.
 pub fn read_expression(s: ref NativeSession, expr_in: ref u8) ref u8 = trust {
     if s == none || !s.stopped || s.current_function == none {
-        return ""
+        return c""
     }
     val expr: ref u8 = trim_raw(expr_in)
-    val n: i64 = string.len_raw(expr)
+    val n: i64 = util.len_raw[_](expr)
     if n == 0 {
-        return ""
+        return c""
     }
     val i: mut i64 = 0
     for {
@@ -1330,16 +1331,16 @@ pub fn read_expression(s: ref NativeSession, expr_in: ref u8) ref u8 = trust {
         i++
     }
     if i == 0 {
-        return ""
+        return c""
     }
     val base: ref u8 = util.copy_cstr_len(expr, i)
     val v: ref dwarf.DwarfVariable = dwarf.find_variable(s.current_function, base)
     if v == none || v.loc_len == 0 {
-        return ""
+        return c""
     }
     val er: EvalResult = eval_expr(s, v.loc_off, v.loc_len)
     if !er.success {
-        return ""
+        return c""
     }
     val addr: mut u64 = er.value
     val is_value: bool = er.is_value
@@ -1369,7 +1370,7 @@ pub fn read_expression(s: ref NativeSession, expr_in: ref u8) ref u8 = trust {
             val t: ref dwarf.DwarfType = unwrap_type(s.dwarf_info, type_off)
             val m: ref dwarf.DwarfMember = member_named(t, field)
             if m == none {
-                return ""
+                return c""
             }
             addr = addr + m.offset
             type_off = m.type_off
@@ -1386,16 +1387,16 @@ pub fn read_expression(s: ref NativeSession, expr_in: ref u8) ref u8 = trust {
                 }
                 i++
             }
-            val idx_opt = util.parse_i64(util.copy_cstr_len(@ptradd(expr, start_idx), i - start_idx))
+            val idx_opt = util.parse_i64[_](util.copy_cstr_len(@ptradd(expr, start_idx), i - start_idx))
             val idx: mut i64 = 0
             if idx_opt is some iv {
                 idx = iv as i64
             } else {
-                return ""
+                return c""
             }
             val t: ref dwarf.DwarfType = unwrap_type(s.dwarf_info, type_off)
             if t == none || t.tag != 1 {
-                return ""
+                return c""
             }
             val esz: i64 = type_size(s.dwarf_info, t.type_off)
             addr = addr + (idx * esz) as u64

@@ -5,6 +5,7 @@
 
 val stdio      = use("std/stdio")
 val string     = use("std/string")
+val cstr       = use("std/string/cstr")
 val allocators = use("std/allocators")
 
 /// Allocate a zeroed buffer and return it as a C string.
@@ -35,74 +36,89 @@ pub fn copy_cstr_len(src: ref u8, len: i64) ref u8 = trust {
     return out
 }
 
-/// Duplicate a C string.
-pub fn copy_cstr(src: ref u8) ref u8 = trust {
-    if src == none {
-        return none
+/// Extract a C string pointer from a String, StringView, or ref u8.
+pub fn as_cstr[T](x: T) ref u8 = trust {
+    return string.as_cstr[T](x)
+}
+
+/// Byte length of a String, StringView, or C string.
+pub fn len_raw[T](s: T) i64 = trust {
+    return cstr.len(string.as_cstr[T](s))
+}
+
+/// Null-safe length for a raw C string.
+pub fn len_or_zero(s: ref u8) i64 = trust {
+    if s == none {
+        return 0
     }
-    return copy_cstr_len(src, string.len_raw(src))
+    return cstr.len(s)
+}
+
+/// Duplicate a String, StringView, or C string.
+pub fn copy_cstr[T](src: T) ref u8 = trust {
+    val s: ref u8 = string.as_cstr[T](src)
+    return copy_cstr_len(s, cstr.len(s))
 }
 
 /// Return the basename component of a path.
-pub fn basename(path: ref u8) ref u8 = trust {
-    if path == none {
-        return ""
-    }
-    val n: i64 = string.len_raw(path)
+pub fn basename[T](path: T) ref u8 = trust {
+    val p: ref u8 = string.as_cstr[T](path)
+    val n: i64 = cstr.len(p)
     val i: mut i64 = n - 1
     for {
         if i < 0 {
             break
         }
-        val c: u8 = @load8(@ptradd(path, i))
+        val c: u8 = @load8(@ptradd(p, i))
         if c == 47 || c == 92 {
-            return @ptradd(path, i + 1)
+            return @ptradd(p, i + 1)
         }
         i--
     }
-    return path
+    return p
 }
 
 /// Return the directory component of a path, or "." if there is none.
-pub fn dirname(path: ref u8) ref u8 = trust {
-    if path == none {
-        return "."
-    }
-    val n: i64 = string.len_raw(path)
+pub fn dirname[T](path: T) ref u8 = trust {
+    val p: ref u8 = string.as_cstr[T](path)
+    val n: i64 = cstr.len(p)
     val i: mut i64 = n - 1
     for {
         if i < 0 {
             break
         }
-        val c: u8 = @load8(@ptradd(path, i))
+        val c: u8 = @load8(@ptradd(p, i))
         if c == 47 || c == 92 {
             if i == 0 {
-                return "/"
+                return c"/"
             }
-            return copy_cstr_len(path, i)
+            return copy_cstr_len(p, i)
         }
         i--
     }
-    return "."
+    return c"."
 }
 
 /// True when `s` starts with `prefix`.
-pub fn starts_with(s: ref u8, prefix: ref u8) bool = trust {
-    return string.raw_starts_with(s, prefix)
+pub fn starts_with[A, B](s: A, prefix: B) bool = trust {
+    return cstr.starts_with(
+        string.as_cstr[A](s), string.as_cstr[B](prefix)
+    )
 }
 
 /// True when `s` ends with `suffix`.
-pub fn ends_with(s: ref u8, suffix: ref u8) bool = trust {
-    return string.raw_ends_with(s, suffix)
+pub fn ends_with[A, B](s: A, suffix: B) bool = trust {
+    return cstr.ends_with(
+        string.as_cstr[A](s), string.as_cstr[B](suffix)
+    )
 }
 
 /// True when `s` contains `needle`.
-pub fn contains(s: ref u8, needle: ref u8) bool = trust {
-    if s == none || needle == none {
-        return false
-    }
-    val n: i64 = string.len_raw(s)
-    val m: i64 = string.len_raw(needle)
+pub fn contains[A, B](s: A, needle: B) bool = trust {
+    val sp: ref u8 = string.as_cstr[A](s)
+    val np: ref u8 = string.as_cstr[B](needle)
+    val n: i64 = cstr.len(sp)
+    val m: i64 = cstr.len(np)
     if m == 0 {
         return true
     }
@@ -120,7 +136,7 @@ pub fn contains(s: ref u8, needle: ref u8) bool = trust {
             if j >= m {
                 break
             }
-            if @load8(@ptradd(s, i + j)) != @load8(@ptradd(needle, j)) {
+            if @load8(@ptradd(sp, i + j)) != @load8(@ptradd(np, j)) {
                 matched = false
                 break
             }
@@ -135,11 +151,9 @@ pub fn contains(s: ref u8, needle: ref u8) bool = trust {
 }
 
 /// Parse a decimal i64. Returns none on invalid input.
-pub fn parse_i64(text: ref u8) option[i64] = trust {
-    if text == none {
-        return none
-    }
-    val n: i64 = string.len_raw(text)
+pub fn parse_i64[T](text_in: T) option[i64] = trust {
+    val text: ref u8 = string.as_cstr[T](text_in)
+    val n: i64 = cstr.len(text)
     if n <= 0 {
         return none
     }
@@ -171,11 +185,9 @@ pub fn parse_i64(text: ref u8) option[i64] = trust {
 }
 
 /// Parse a hexadecimal u64, with an optional 0x/0X prefix.
-pub fn parse_u64_hex(text: ref u8) option[u64] = trust {
-    if text == none {
-        return none
-    }
-    val n: i64 = string.len_raw(text)
+pub fn parse_u64_hex[T](text_in: T) option[u64] = trust {
+    val text: ref u8 = string.as_cstr[T](text_in)
+    val n: i64 = cstr.len(text)
     val i: mut i64 = 0
     if n >= 2 {
         val c0: u8 = @load8(@ptradd(text, 0))
@@ -212,10 +224,10 @@ pub fn parse_u64_hex(text: ref u8) option[u64] = trust {
 
 /// Format a u64 as lowercase hexadecimal without a prefix.
 pub fn hex_u64(value: u64) ref u8 = trust {
-    val digits: ref u8 = "0123456789abcdef"
+    val digits: ref u8 = c"0123456789abcdef"
     val buf: ref u8 = alloc_cstr(18)
     if buf == none {
-        return ""
+        return c""
     }
     if value == 0 {
         @store8(buf, 48)
@@ -338,13 +350,13 @@ pub fn sleb_len(data: ref u8, off: u64) u64 = trust {
 }
 
 /// Zero-copy case-insensitive? No: exact string equality helper.
-pub fn eq(a: ref u8, b: ref u8) bool = trust {
-    return string.str_eql(a, b)
+pub fn eq[A, B](a: A, b: B) bool = trust {
+    return cstr.eql(string.as_cstr[A](a), string.as_cstr[B](b))
 }
 
 /// Print a diagnostic prefixed with "phantom: ".
-pub fn die(msg: ref u8) void = trust {
-    stdio.eprint("phantom: {s}\n", {msg})
+pub fn die[T](msg: T) void = trust {
+    stdio.eprint("phantom: {s}\n", {string.as_cstr[T](msg)})
 }
 
 /// Return a zero-sized heap allocator, used for lists whose lifetime is the

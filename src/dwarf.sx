@@ -3,7 +3,6 @@
 /// (C) Navid Momtahen - 2026
 /// SPDX-License-Identifier: GPL-3.0-only
 
-val string     = use("std/string")
 val allocators = use("std/allocators")
 val elf        = use("elf.sx")
 val util       = use("util.sx")
@@ -332,14 +331,14 @@ fn addr_from_index(info: ref DwarfInfo, cu: ref DwarfCu, index: u64) u64 = trust
 
 fn line_str_at(info: ref DwarfInfo, off: u64) ref u8 = trust {
     if info.line_str_data == none || off >= info.line_str_size {
-        return ""
+        return c""
     }
     return @ptradd(info.line_str_data, off as i64)
 }
 
 fn str_at(info: ref DwarfInfo, off: u64) ref u8 = trust {
     if info.str_data == none || off >= info.str_size {
-        return ""
+        return c""
     }
     return @ptradd(info.str_data, off as i64)
 }
@@ -402,7 +401,7 @@ fn read_form(
     } elif form == 8 {
         out.str = @ptradd(data, pos as i64)
         out.is_str = true
-        pos += (string.len_raw(out.str) + 1) as u64
+        pos += (util.len_raw[ref u8](out.str) + 1) as u64
     } elif form == 11 {
         out.u = read_uint(data, pos, 1)
         pos += 1
@@ -515,12 +514,12 @@ fn attr_by_name(die: ref DwarfDie, at: u64) ref DwarfAttr = trust {
 fn attr_str(die: ref DwarfDie, at: u64) ref u8 = trust {
     val a: ref DwarfAttr = attr_by_name(die, at)
     if a == none {
-        return ""
+        return c""
     }
     if a.is_str {
         return a.str
     }
-    return ""
+    return c""
 }
 
 fn attr_u(die: ref DwarfDie, at: u64) u64 = trust {
@@ -703,7 +702,7 @@ fn read_line_form(
     if form == 8 {
         val sv: ref u8 = @ptradd(data, pos as i64)
         @store(out_str, sv)
-        pos += (string.len_raw(sv) + 1) as u64
+        pos += (util.len_raw[_](sv) + 1) as u64
     } elif form == 31 || form == 14 {
         val off: u64 = read_uint(data, pos, 4)
         @store(out_str, line_str_at(info, off))
@@ -734,12 +733,12 @@ fn read_line_form(
 
 fn join_line_path(dir: ref u8, name: ref u8) ref u8 = trust {
     if name == none {
-        return ""
+        return c""
     }
     if @load8(name) == 47 {
         return name
     }
-    if dir == none || string.len_raw(dir) == 0 {
+    if dir == none || util.len_or_zero(dir) == 0 {
         return name
     }
     return @fmtalloc("{s}/{s}", {dir, name})
@@ -820,7 +819,7 @@ fn parse_line_table(info: mut ref DwarfInfo, cu: ref DwarfCu) void = trust {
             if dj >= (dir_count as i64) {
                 break
             }
-            val dir_path: mut ref u8 = ""
+            val dir_path: mut ref u8 = c""
             val k: mut i64 = 0
             for {
                 if k >= (dir_fmt_count as i64) {
@@ -831,7 +830,7 @@ fn parse_line_table(info: mut ref DwarfInfo, cu: ref DwarfCu) void = trust {
                 if fm_opt is some fv {
                     fm = fv as u64
                 }
-                val tmp_str: mut ref u8 = ""
+                val tmp_str: mut ref u8 = c""
                 val tmp_num: mut u64 = 0
                 pos = read_line_form(info, fm, pos, @addr(tmp_str), @addr(tmp_num))
                 if k < @len(dir_types) as i64 {
@@ -872,7 +871,7 @@ fn parse_line_table(info: mut ref DwarfInfo, cu: ref DwarfCu) void = trust {
             if fj >= (file_count as i64) {
                 break
             }
-            val file_name: mut ref u8 = ""
+            val file_name: mut ref u8 = c""
             val dir_idx: mut u64 = 0
             val k: mut i64 = 0
             for {
@@ -884,7 +883,7 @@ fn parse_line_table(info: mut ref DwarfInfo, cu: ref DwarfCu) void = trust {
                 if fm_opt is some fv {
                     fm = fv as u64
                 }
-                val tmp_str: mut ref u8 = ""
+                val tmp_str: mut ref u8 = c""
                 val tmp_num: mut u64 = 0
                 pos = read_line_form(info, fm, pos, @addr(tmp_str), @addr(tmp_num))
                 if k < @len(file_types) as i64 {
@@ -900,7 +899,7 @@ fn parse_line_table(info: mut ref DwarfInfo, cu: ref DwarfCu) void = trust {
                 }
                 k++
             }
-            val dir: mut ref u8 = ""
+            val dir: mut ref u8 = c""
             if dir_idx < (@len(dirs) as u64) {
                 val d_opt = @get(dirs, dir_idx as usize)
                 if d_opt is some dv {
@@ -919,7 +918,7 @@ fn parse_line_table(info: mut ref DwarfInfo, cu: ref DwarfCu) void = trust {
                 break
             }
             @append(dirs, p)
-            pos += (string.len_raw(p) + 1) as u64
+            pos += (util.len_raw[_](p) + 1) as u64
         }
         for {
             val p: ref u8 = @ptradd(data, pos as i64)
@@ -928,14 +927,14 @@ fn parse_line_table(info: mut ref DwarfInfo, cu: ref DwarfCu) void = trust {
                 break
             }
             val fname: ref u8 = p
-            pos += (string.len_raw(p) + 1) as u64
+            pos += (util.len_raw[_](p) + 1) as u64
             val dir_idx: u64 = util.read_uleb(data, pos)
             pos += util.uleb_len(data, pos)
             util.read_uleb(data, pos)
             pos += util.uleb_len(data, pos)
             util.read_uleb(data, pos)
             pos += util.uleb_len(data, pos)
-            val dir: mut ref u8 = ""
+            val dir: mut ref u8 = c""
             if dir_idx < (@len(dirs) as u64) {
                 val d_opt = @get(dirs, dir_idx as usize)
                 if d_opt is some dv {
@@ -1090,7 +1089,7 @@ fn line_file(files: list[ref u8], index: u64, version: u16) ref u8 = trust {
             if first is some v {
                 return v as ref u8
             }
-            return ""
+            return c""
         }
         if index > 0 && index - 1 < n {
             val opt2 = @get(files, (index - 1) as usize)
@@ -1105,7 +1104,7 @@ fn line_file(files: list[ref u8], index: u64, version: u16) ref u8 = trust {
             return v as ref u8
         }
     }
-    return ""
+    return c""
 }
 
 fn file_for_index(info: ref DwarfInfo, index: u64, version: u16) ref u8 = trust {
@@ -1192,7 +1191,7 @@ fn build_functions(info: mut ref DwarfInfo) void = trust {
             }
         }
         val name: ref u8 = attr_str(die, AT_NAME)
-        if string.len_raw(name) == 0 {
+        if util.len_or_zero(name) == 0 {
             continue
         }
         val f: mut ref DwarfFunction = allocators.Arena.alloc_or_none(
@@ -1256,20 +1255,20 @@ pub fn load(
     @memset(info, 0, @sizeof(DwarfInfo) as usize)
     info.elf = e
     info.arena = arena
-    info.info_data = section_ptr(e, ".debug_info")
-    info.info_size = section_size(e, ".debug_info")
-    info.abbrev_data = section_ptr(e, ".debug_abbrev")
-    info.abbrev_size = section_size(e, ".debug_abbrev")
-    info.str_data = section_ptr(e, ".debug_str")
-    info.str_size = section_size(e, ".debug_str")
-    info.line_str_data = section_ptr(e, ".debug_line_str")
-    info.line_str_size = section_size(e, ".debug_line_str")
-    info.addr_data = section_ptr(e, ".debug_addr")
-    info.addr_size = section_size(e, ".debug_addr")
-    info.str_offsets_data = section_ptr(e, ".debug_str_offsets")
-    info.str_offsets_size = section_size(e, ".debug_str_offsets")
-    info.line_data = section_ptr(e, ".debug_line")
-    info.line_size = section_size(e, ".debug_line")
+    info.info_data = section_ptr(e, c".debug_info")
+    info.info_size = section_size(e, c".debug_info")
+    info.abbrev_data = section_ptr(e, c".debug_abbrev")
+    info.abbrev_size = section_size(e, c".debug_abbrev")
+    info.str_data = section_ptr(e, c".debug_str")
+    info.str_size = section_size(e, c".debug_str")
+    info.line_str_data = section_ptr(e, c".debug_line_str")
+    info.line_str_size = section_size(e, c".debug_line_str")
+    info.addr_data = section_ptr(e, c".debug_addr")
+    info.addr_size = section_size(e, c".debug_addr")
+    info.str_offsets_data = section_ptr(e, c".debug_str_offsets")
+    info.str_offsets_size = section_size(e, c".debug_str_offsets")
+    info.line_data = section_ptr(e, c".debug_line")
+    info.line_size = section_size(e, c".debug_line")
     if info.info_data == none || info.info_size == 0 || info.abbrev_data == none {
         return err @fmtalloc("'{s}' has no DWARF debug information (compile with the ALT backend)", {e.path})
     }
@@ -1326,15 +1325,15 @@ pub fn address_for_line(
     file: ref u8,
     line: i64
 ) option[u64] = trust {
-    val base4: ref u8 = util.basename(file)
+    val base4: ref u8 = util.basename[_](file)
     for row in info.lines {
         if row.line != line {
             continue
         }
-        if string.len_raw(row.file) == 0 {
+        if util.len_or_zero(row.file) == 0 {
             continue
         }
-        if string.str_eql(row.file, file) || string.str_eql(util.basename(row.file), base4) {
+        if util.eq[ref u8, ref u8](row.file, file) || util.eq[ref u8, ref u8](util.basename[ref u8](row.file), base4) {
             return some row.address
         }
     }
@@ -1344,13 +1343,13 @@ pub fn address_for_line(
 /// Return the closest earlier line row for a source line, used when asking to
 /// stop on a line with no emitted code.
 pub fn nearest_line_row(info: ref DwarfInfo, file: ref u8, line: i64) ref DwarfLineRow = trust {
-    val base4: ref u8 = util.basename(file)
+    val base4: ref u8 = util.basename[_](file)
     val best: mut ref DwarfLineRow = none
     for row in info.lines {
-        if string.len_raw(row.file) == 0 {
+        if util.len_or_zero(row.file) == 0 {
             continue
         }
-        if !string.str_eql(row.file, file) && !string.str_eql(util.basename(row.file), base4) {
+        if !util.eq[ref u8, ref u8](row.file, file) && !util.eq[ref u8, ref u8](util.basename[ref u8](row.file), base4) {
             continue
         }
         if row.line <= line {
@@ -1375,7 +1374,7 @@ pub fn find_function(info: ref DwarfInfo, query: ref u8) ref DwarfFunction = tru
 /// Find a type by raw or source-level name.
 pub fn find_type_by_name(info: ref DwarfInfo, name: ref u8) ref DwarfType = trust {
     for t in info.types {
-        if t.name != none && (string.str_eql(t.name, name) || string.str_eql(demangle.source_name(t.name), name)) {
+        if t.name != none && (util.eq[ref u8, ref u8](t.name, name) || util.eq[ref u8, ref u8](demangle.source_name(t.name), name)) {
             return t
         }
     }
@@ -1396,7 +1395,7 @@ pub fn find_variable(f: ref DwarfFunction, name: ref u8) ref DwarfVariable = tru
         return none
     }
     for v in f.variables {
-        if string.str_eql(v.source_name, name) || string.str_eql(v.name, name) {
+        if util.eq[ref u8, ref u8](v.source_name, name) || util.eq[ref u8, ref u8](v.name, name) {
             return v
         }
     }

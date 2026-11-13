@@ -61,27 +61,75 @@ fn next_seq(s: mut ref DapState) i64 = trust {
     return s.seq
 }
 
-fn obj_add_str(b: json.JsonBuilder, obj: ref void, key: ref u8, value: ref u8) void = trust {
-    json.object_add(obj, json.build_str(b, key), json.build_str(b, value))
+fn new_builder() json.JsonBuilder = trust {
+    match json.builder_new() {
+        ok b => {
+            return b
+        }
+        err _ => {
+            os.exit(1)
+        }
+    }
+    return json.JsonBuilder{ptr: none}
 }
 
-fn obj_add_int(b: json.JsonBuilder, obj: ref void, key: ref u8, value: i64) void = trust {
-    json.object_add(obj, json.build_str(b, key), json.build_int(b, value))
+fn nil_json() json.JsonValue = trust {
+    return json.JsonValue{node: none, owner: none}
 }
 
-fn obj_add_bool(b: json.JsonBuilder, obj: ref void, key: ref u8, value: bool) void = trust {
-    json.object_add(obj, json.build_str(b, key), json.build_bool(b, value))
+fn obj_add_str(
+    b: json.JsonBuilder,
+    obj: json.JsonValue,
+    key: ref u8,
+    value: ref u8
+) void = trust {
+    json.object_add(
+        b,
+        obj,
+        string.from_cstr(key),
+        json.build_string(b, string.from_cstr(value))
+    )
 }
 
-fn obj_add_obj(b: json.JsonBuilder, obj: ref void, key: ref u8, value: ref void) void = trust {
-    json.object_add(obj, json.build_str(b, key), value)
+fn obj_add_int(
+    b: json.JsonBuilder,
+    obj: json.JsonValue,
+    key: ref u8,
+    value: i64
+) void = trust {
+    json.object_add(b, obj, string.from_cstr(key), json.build_int(b, value))
 }
 
+fn obj_add_bool(
+    b: json.JsonBuilder,
+    obj: json.JsonValue,
+    key: ref u8,
+    value: bool
+) void = trust {
+    json.object_add(b, obj, string.from_cstr(key), json.build_bool(b, value))
+}
+
+fn obj_add_obj(
+    b: json.JsonBuilder,
+    obj: json.JsonValue,
+    key: ref u8,
+    value: json.JsonValue
+) void = trust {
+    json.object_add(b, obj, string.from_cstr(key), value)
+}
 
 fn send_json(text: ref u8) void = trust {
-    val len: i64 = string.len_raw(text)
+    val len: i64 = util.len_raw[_](text)
     stdio.print("Content-Length: {d}\r\n\r\n{s}", {len, text})
     fflush(@stdout())
+}
+
+fn send_builder(_: mut ref DapState, b: json.JsonBuilder) void = trust {
+    val text_s: string.String = json.builder_to_string[
+        allocators.HeapAllocator
+    ](util.heap(), b)
+    val text: ref u8 = text_s.ptr
+    send_json(text)
 }
 
 fn send_response(
@@ -89,74 +137,71 @@ fn send_response(
     request_seq: i64,
     command: ref u8,
     success: bool,
-    body: ref void
+    body: json.JsonValue
 ) void = trust {
-    val b: json.JsonBuilder = json.builder_new()
-    val root: ref void = json.build_object(b)
-    obj_add_int(b, root, "seq", next_seq(s))
-    obj_add_str(b, root, "type", "response")
-    obj_add_int(b, root, "request_seq", request_seq)
-    obj_add_bool(b, root, "success", success)
-    obj_add_str(b, root, "command", command)
-    if body != none {
-        obj_add_obj(b, root, "body", body)
+    val b: json.JsonBuilder = new_builder()
+    val root: json.JsonValue = json.build_object(b)
+    obj_add_int(b, root, c"seq", next_seq(s))
+    obj_add_str(b, root, c"type", c"response")
+    obj_add_int(b, root, c"request_seq", request_seq)
+    obj_add_bool(b, root, c"success", success)
+    obj_add_str(b, root, c"command", command)
+    if body.node != none {
+        obj_add_obj(b, root, c"body", body)
     }
     json.builder_set_root(b, root)
-    val text: ref u8 = json.builder_to_string[allocators.Arena](s.arena, b)
-    send_json(text)
+    send_builder(s, b)
     json.builder_free(b)
 }
 
 fn send_error(s: mut ref DapState, request_seq: i64, command: ref u8, message: ref u8) void = trust {
-    val b: json.JsonBuilder = json.builder_new()
-    val root: ref void = json.build_object(b)
-    obj_add_int(b, root, "seq", next_seq(s))
-    obj_add_str(b, root, "type", "response")
-    obj_add_int(b, root, "request_seq", request_seq)
-    obj_add_bool(b, root, "success", false)
-    obj_add_str(b, root, "command", command)
-    obj_add_str(b, root, "message", message)
+    val b: json.JsonBuilder = new_builder()
+    val root: json.JsonValue = json.build_object(b)
+    obj_add_int(b, root, c"seq", next_seq(s))
+    obj_add_str(b, root, c"type", c"response")
+    obj_add_int(b, root, c"request_seq", request_seq)
+    obj_add_bool(b, root, c"success", false)
+    obj_add_str(b, root, c"command", command)
+    obj_add_str(b, root, c"message", message)
     json.builder_set_root(b, root)
-    val text: ref u8 = json.builder_to_string[allocators.Arena](s.arena, b)
-    send_json(text)
+    send_builder(s, b)
     json.builder_free(b)
 }
 
-fn send_event(s: mut ref DapState, event_name: ref u8, body: ref void) void = trust {
-    val b: json.JsonBuilder = json.builder_new()
-    val root: ref void = json.build_object(b)
-    obj_add_int(b, root, "seq", next_seq(s))
-    obj_add_str(b, root, "type", "event")
-    obj_add_str(b, root, "event", event_name)
-    if body != none {
-        obj_add_obj(b, root, "body", body)
+fn send_event(s: mut ref DapState, event_name: ref u8, body: json.JsonValue) void = trust {
+    val b: json.JsonBuilder = new_builder()
+    val root: json.JsonValue = json.build_object(b)
+    obj_add_int(b, root, c"seq", next_seq(s))
+    obj_add_str(b, root, c"type", c"event")
+    obj_add_str(b, root, c"event", event_name)
+    if body.node != none {
+        obj_add_obj(b, root, c"body", body)
     }
     json.builder_set_root(b, root)
-    val text: ref u8 = json.builder_to_string[allocators.Arena](s.arena, b)
-    send_json(text)
+    send_builder(s, b)
     json.builder_free(b)
 }
 
 fn send_stopped(s: mut ref DapState, reason: ref u8) void = trust {
     s.stop_reason = reason
-    val b: json.JsonBuilder = json.builder_new()
-    val body: ref void = json.build_object(b)
-    obj_add_str(b, body, "reason", reason)
-    obj_add_int(b, body, "threadId", 1)
-    obj_add_bool(b, body, "allThreadsStopped", true)
-    send_event(s, "stopped", body)
+    val b: json.JsonBuilder = new_builder()
+    val body: json.JsonValue = json.build_object(b)
+    obj_add_str(b, body, c"reason", reason)
+    obj_add_int(b, body, c"threadId", 1)
+    obj_add_bool(b, body, c"allThreadsStopped", true)
+    send_event(s, c"stopped", body)
     json.builder_free(b)
 }
 
 fn send_exited(s: mut ref DapState, code: i64) void = trust {
     s.exited = true
-    val b: json.JsonBuilder = json.builder_new()
-    val body: ref void = json.build_object(b)
-    obj_add_int(b, body, "exitCode", code)
-    send_event(s, "exited", body)
+    val b: json.JsonBuilder = new_builder()
+    val body: json.JsonValue = json.build_object(b)
+    obj_add_int(b, body, c"exitCode", code)
+    send_event(s, c"exited", body)
     json.builder_free(b)
-    val b2: json.JsonBuilder = json.builder_new()
-    send_event(s, "terminated", none)
+    val b2: json.JsonBuilder = new_builder()
+    send_event(s, c"terminated", nil_json())
     json.builder_free(b2)
 }
 
@@ -170,13 +215,13 @@ fn read_packet() option[ref u8] = trust {
             return none
         }
         val line: ref u8 = @addr(header) as ref u8
-        val n: i64 = string.len_raw(line)
+        val n: i64 = util.len_raw[_](line)
         if n <= 2 {
             break
         }
-        if string.raw_starts_with(line, "Content-Length:") {
+        if util.starts_with[_, _](line, "Content-Length:") {
             val num: ref u8 = @ptradd(line, 15)
-            val v_opt = util.parse_i64(trim_raw(num))
+            val v_opt = util.parse_i64[ref u8](trim_raw(num))
             if v_opt is some v {
                 content_len = v
             }
@@ -193,7 +238,7 @@ fn read_packet() option[ref u8] = trust {
 }
 
 fn trim_raw(s: ref u8) ref u8 = trust {
-    val n: i64 = string.len_raw(s)
+    val n: i64 = util.len_raw[_](s)
     val start: mut i64 = 0
     val end: mut i64 = n
     for {
@@ -220,32 +265,32 @@ fn trim_raw(s: ref u8) ref u8 = trust {
 }
 
 fn find_compiler(explicit: ref u8) ref u8 = trust {
-    if explicit != none && string.len_raw(explicit) > 0 {
+    if explicit != none && util.len_or_zero(explicit) > 0 {
         return explicit
     }
-    val env1 = os.getenv("PHANTOM_COMPILER")
-    if env1 != none && string.len_raw(env1) > 0 {
+    val env1 = os.getenv(c"PHANTOM_COMPILER")
+    if env1 != none && util.len_or_zero(env1) > 0 {
         return env1
     }
-    if os.in_path("spectre-dev") {
-        return "spectre-dev"
+    if os.in_path(c"spectre-dev") {
+        return c"spectre-dev"
     }
-    if os.in_path("spectre") {
-        return "spectre"
+    if os.in_path(c"spectre") {
+        return c"spectre"
     }
-    if os.exists("../spectre/spectre-dev") {
-        return "../spectre/spectre-dev"
+    if os.exists(c"../spectre/spectre-dev") {
+        return c"../spectre/spectre-dev"
     }
-    return "spectre"
+    return c"spectre"
 }
 
 fn build_source(compiler: ref u8, source: ref u8) result[ref u8, ref u8] = trust {
-    val base: mut ref u8 = util.basename(source)
-    if string.raw_ends_with(base, ".sx") {
-        base = util.copy_cstr_len(base, string.len_raw(base) - 3)
+    val base: mut ref u8 = util.basename[_](source)
+    if util.ends_with[_, _](base, ".sx") {
+        base = util.copy_cstr_len(base, util.len_raw[_](base) - 3)
     }
     val out: ref u8 = @fmtalloc("{s}/phantom-dap-{d}-{s}", {
-        fs.temp_dir_raw(), dap_pid(), base
+        fs.temp_dir_cstr(), dap_pid(), base
     })
     val cmd: ref u8 = @fmtalloc(
         "{s} {s} -alt -no-single-flags -o {s} 2>&1",
@@ -258,7 +303,7 @@ fn build_source(compiler: ref u8, source: ref u8) result[ref u8, ref u8] = trust
         }
         ok output => {
             if !os.exists(out) {
-                return err @fmtalloc("build failed:\n{s}", {string.cstr(output)})
+                return err @fmtalloc("build failed:\n{s}", {output.ptr})
             }
         }
     }
@@ -270,7 +315,7 @@ fn load_metadata(arena: allocators.Arena, program: ref u8) result[ref target.Tar
 }
 
 fn create_lldb(s: mut ref DapState, program: ref u8) bool = trust {
-    val opt = lldb.new("lldb", program)
+    val opt = lldb.new(c"lldb", program)
     match opt {
         err e => {
             stdio.eprint("phantom dap: {s}\n", {e})
@@ -305,7 +350,7 @@ fn apply_breakpoints_lldb(s: mut ref DapState) bool = trust {
     if s.lldb_session == none {
         return false
     }
-    lldb.command(s.lldb_session, "breakpoint delete --force")
+    lldb.command(s.lldb_session, c"breakpoint delete --force")
     val n: i64 = @len(s.bp_files) as i64
     val i: mut i64 = 0
     for {
@@ -359,7 +404,7 @@ fn apply_breakpoints_native(s: mut ref DapState) void = trust {
             if l_opt is some line {
             val addr_opt = target.line_address(s.metadata, f as ref u8, line as i64)
             if addr_opt is some addr {
-                native.add_breakpoint(s.native_session, addr, f as ref u8, "source")
+                native.add_breakpoint(s.native_session, addr, f as ref u8, c"source")
             }
             }
         }
@@ -384,7 +429,7 @@ fn replace_file_breakpoints(
         val l_opt = @get(s.bp_lines, i as usize)
         if f_opt is some f {
             if l_opt is some line {
-                if !string.str_eql(f as ref u8, file) {
+                if !util.eq[_, _](f as ref u8, file) {
                     @append(new_files, f as ref u8)
                     @append(new_lines, line as i64)
                 }
@@ -393,12 +438,12 @@ fn replace_file_breakpoints(
         i++
     }
     for line in lines {
-        @append(new_files, util.copy_cstr(file))
+        @append(new_files, util.copy_cstr[_](file))
         @append(new_lines, line)
     }
     s.bp_files = new_files
     s.bp_lines = new_lines
-    if string.str_eql(s.backend, "lldb") {
+    if util.eq[ref u8, StringView](s.backend, "lldb") {
         apply_breakpoints_lldb(s)
     } else {
         apply_breakpoints_native(s)
@@ -406,54 +451,54 @@ fn replace_file_breakpoints(
 }
 
 fn handle_initialize(s: mut ref DapState, req_seq: i64) void = trust {
-    val b: json.JsonBuilder = json.builder_new()
-    val body: ref void = json.build_object(b)
-    obj_add_bool(b, body, "supportsConfigurationDoneRequest", true)
-    obj_add_bool(b, body, "supportsFunctionBreakpoints", true)
-    obj_add_bool(b, body, "supportsEvaluateForHovers", true)
-    obj_add_bool(b, body, "supportsSetVariable", false)
-    obj_add_bool(b, body, "supportsTerminateRequest", false)
-    send_response(s, req_seq, "initialize", true, body)
+    val b: json.JsonBuilder = new_builder()
+    val body: json.JsonValue = json.build_object(b)
+    obj_add_bool(b, body, c"supportsConfigurationDoneRequest", true)
+    obj_add_bool(b, body, c"supportsFunctionBreakpoints", true)
+    obj_add_bool(b, body, c"supportsEvaluateForHovers", true)
+    obj_add_bool(b, body, c"supportsSetVariable", false)
+    obj_add_bool(b, body, c"supportsTerminateRequest", false)
+    send_response(s, req_seq, c"initialize", true, body)
     json.builder_free(b)
     s.initialized = true
-    send_event(s, "initialized", none)
+    send_event(s, c"initialized", none)
 }
 
-fn handle_launch(s: mut ref DapState, req_seq: i64, args: ref void) void = trust {
+fn handle_launch(s: mut ref DapState, req_seq: i64, args: json.JsonValue) void = trust {
     val program: mut ref u8 = s.program
     val prog_args: mut list[ref u8] = @listalloc[allocators.HeapAllocator, ref u8](util.heap())?
     if args != none {
-        val p_opt = json.obj_get_str(args, "program")
+        val p_opt = json.object_get_str(args, "program")
         if p_opt is some p {
             program = p as ref u8
         }
-        val a_opt = json.obj_get(args, "args")
+        val a_opt = json.object_get(args, "args")
         if a_opt is some arr {
-            val alen: i64 = json.arr_len(arr as ref void) as i64
+            val alen: i64 = json.len(arr) as i64
             val ai: mut i64 = 0
             for {
                 if ai >= alen {
                     break
                 }
-                val el = json.arr_get(arr as ref void, ai as usize)
+                val el = json.array_get(arr, ai as i64)
                 if el is some ev {
-                    if json.val_is_str(ev as ref void) {
-                        @append(prog_args, json.val_get_str(ev as ref void))
+                    if json.is_string(ev) {
+                        @append(prog_args, util.copy_cstr[StringView](json.as_string(ev)))
                     }
                 }
                 ai++
             }
         }
     }
-    if string.len_raw(program) == 0 {
-        send_error(s, req_seq, "launch", "no program specified (pass --program or use a launch request)")
+    if util.len_raw[_](program) == 0 {
+        send_error(s, req_seq, c"launch", c"no program specified (pass --program or use a launch request)")
         return
     }
-    if string.raw_ends_with(program, ".sx") {
+    if util.ends_with[_, _](program, ".sx") {
         val built = build_source(find_compiler(s.compiler), program)
         match built {
             err e => {
-                send_error(s, req_seq, "launch", e)
+                send_error(s, req_seq, c"launch", e)
                 return
             }
             ok pv => {
@@ -469,10 +514,10 @@ fn handle_launch(s: mut ref DapState, req_seq: i64, args: ref void) void = trust
     val meta_opt = load_metadata(arena, program)
     match meta_opt {
         err e => {
-            if string.str_eql(s.backend, "lldb") {
+            if util.eq[ref u8, StringView](s.backend, "lldb") {
                 s.metadata = target.empty(arena, program)
             } else {
-                send_error(s, req_seq, "launch", e)
+                send_error(s, req_seq, c"launch", e)
                 return
             }
         }
@@ -481,26 +526,26 @@ fn handle_launch(s: mut ref DapState, req_seq: i64, args: ref void) void = trust
         }
     }
 
-    if string.str_eql(s.backend, "lldb") {
+    if util.eq[ref u8, StringView](s.backend, "lldb") {
         if !create_lldb(s, program) {
-            send_error(s, req_seq, "launch", "could not start LLDB")
+            send_error(s, req_seq, c"launch", c"could not start LLDB")
             return
         }
     } else {
         if !create_native(s, program) {
-            send_error(s, req_seq, "launch", "could not load native debug info")
+            send_error(s, req_seq, c"launch", c"could not load native debug info")
             return
         }
     }
-    send_response(s, req_seq, "launch", true, none)
+    send_response(s, req_seq, c"launch", true, none)
 }
 
-fn handle_set_breakpoints(s: mut ref DapState, req_seq: i64, args: ref void) void = trust {
-    val file: mut ref u8 = ""
+fn handle_set_breakpoints(s: mut ref DapState, req_seq: i64, args: json.JsonValue) void = trust {
+    val file: mut ref u8 = c""
     if args != none {
-        val src_opt = json.obj_get(args, "source")
+        val src_opt = json.object_get(args, "source")
         if src_opt is some src {
-            val path_opt = json.obj_get_str(src as ref void, "path")
+            val path_opt = json.object_get_str(src, "path")
             if path_opt is some p {
                 file = p as ref u8
             }
@@ -508,17 +553,17 @@ fn handle_set_breakpoints(s: mut ref DapState, req_seq: i64, args: ref void) voi
     }
     val lines: mut list[i64] = @listalloc[allocators.HeapAllocator, i64](util.heap())?
     if args != none {
-        val bps_opt = json.obj_get(args, "breakpoints")
+        val bps_opt = json.object_get(args, "breakpoints")
         if bps_opt is some arr {
-            val alen: i64 = json.arr_len(arr as ref void) as i64
+            val alen: i64 = json.len(arr) as i64
             val ai: mut i64 = 0
             for {
                 if ai >= alen {
                     break
                 }
-                val el = json.arr_get(arr as ref void, ai as usize)
+                val el = json.array_get(arr, ai as i64)
                 if el is some ev {
-                    val line_opt = json.obj_get_int(ev as ref void, "line")
+                    val line_opt = json.object_get_int(ev, "line")
                     if line_opt is some line {
                         @append(lines, line)
                     }
@@ -529,50 +574,50 @@ fn handle_set_breakpoints(s: mut ref DapState, req_seq: i64, args: ref void) voi
     }
     replace_file_breakpoints(s, file, lines)
 
-    val b: json.JsonBuilder = json.builder_new()
-    val body: ref void = json.build_object(b)
-    val arr: ref void = json.build_array(b)
+    val b: json.JsonBuilder = new_builder()
+    val body: json.JsonValue = json.build_object(b)
+    val arr: json.JsonValue = json.build_array(b)
     val id: mut i64 = 1
     for line in lines {
-        val bp: ref void = json.build_object(b)
-        obj_add_bool(b, bp, "verified", true)
-        obj_add_int(b, bp, "line", line)
-        obj_add_int(b, bp, "id", id)
-        obj_add_obj(b, arr, "", bp)
+        val bp: json.JsonValue = json.build_object(b)
+        obj_add_bool(b, bp, c"verified", true)
+        obj_add_int(b, bp, c"line", line)
+        obj_add_int(b, bp, c"id", id)
+        obj_add_obj(b, arr, c"", bp)
         // DAP arrays need an append, not object_add. Rebuild below.
         id++
     }
     // Build a proper array using array_append.
-    val arr2: ref void = json.build_array(b)
+    val arr2: json.JsonValue = json.build_array(b)
     for line in lines {
-        val bp2: ref void = json.build_object(b)
-        obj_add_bool(b, bp2, "verified", true)
-        obj_add_int(b, bp2, "line", line)
-        obj_add_int(b, bp2, "id", line)
+        val bp2: json.JsonValue = json.build_object(b)
+        obj_add_bool(b, bp2, c"verified", true)
+        obj_add_int(b, bp2, c"line", line)
+        obj_add_int(b, bp2, c"id", line)
         json.array_append(arr2, bp2)
     }
-    obj_add_obj(b, body, "breakpoints", arr2)
-    send_response(s, req_seq, "setBreakpoints", true, body)
+    obj_add_obj(b, body, c"breakpoints", arr2)
+    send_response(s, req_seq, c"setBreakpoints", true, body)
     json.builder_free(b)
 }
 
-fn handle_set_function_breakpoints(s: mut ref DapState, req_seq: i64, args: ref void) void = trust {
+fn handle_set_function_breakpoints(s: mut ref DapState, req_seq: i64, args: json.JsonValue) void = trust {
     if args != none && s.lldb_session != none {
-        val bps_opt = json.obj_get(args, "breakpoints")
+        val bps_opt = json.object_get(args, "breakpoints")
         if bps_opt is some arr {
-            val alen: i64 = json.arr_len(arr as ref void) as i64
+            val alen: i64 = json.len(arr) as i64
             val ai: mut i64 = 0
             for {
                 if ai >= alen {
                     break
                 }
-                val el = json.arr_get(arr as ref void, ai as usize)
+                val el = json.array_get(arr, ai as i64)
                 if el is some ev {
-                    val name_opt = json.obj_get_str(ev as ref void, "name")
+                    val name_opt = json.object_get_str(ev, "name")
                     if name_opt is some name {
                         val raw: ref u8 = target.function_raw(s.metadata, name as ref u8)
                         val bname: mut ref u8 = raw
-                        if string.len_raw(bname) == 0 {
+                        if util.len_raw[_](bname) == 0 {
                             bname = name as ref u8
                         }
                         lldb.breakpoint_symbol(s.lldb_session, bname)
@@ -582,22 +627,22 @@ fn handle_set_function_breakpoints(s: mut ref DapState, req_seq: i64, args: ref 
             }
         }
     } elif args != none && s.native_session != none {
-        val bps_opt = json.obj_get(args, "breakpoints")
+        val bps_opt = json.object_get(args, "breakpoints")
         if bps_opt is some arr {
-            val alen: i64 = json.arr_len(arr as ref void) as i64
+            val alen: i64 = json.len(arr) as i64
             val ai: mut i64 = 0
             for {
                 if ai >= alen {
                     break
                 }
-                val el = json.arr_get(arr as ref void, ai as usize)
+                val el = json.array_get(arr, ai as i64)
                 if el is some ev {
-                    val name_opt = json.obj_get_str(ev as ref void, "name")
+                    val name_opt = json.object_get_str(ev, "name")
                     if name_opt is some name {
                         val addr_opt = target.function_address(s.metadata, name as ref u8)
                         if addr_opt is some addr {
                             val raw: ref u8 = target.function_raw(s.metadata, name as ref u8)
-                            native.add_breakpoint(s.native_session, addr, raw, "function")
+                            native.add_breakpoint(s.native_session, addr, raw, c"function")
                         }
                     }
                 }
@@ -605,11 +650,11 @@ fn handle_set_function_breakpoints(s: mut ref DapState, req_seq: i64, args: ref 
             }
         }
     }
-    send_response(s, req_seq, "setFunctionBreakpoints", true, none)
+    send_response(s, req_seq, c"setFunctionBreakpoints", true, none)
 }
 
 fn handle_configuration_done(s: mut ref DapState, req_seq: i64) void = trust {
-    send_response(s, req_seq, "configurationDone", true, none)
+    send_response(s, req_seq, c"configurationDone", true, none)
     s.configured = true
     start_program(s)
 }
@@ -619,18 +664,18 @@ fn start_program(s: mut ref DapState) void = trust {
         return
     }
     s.started = true
-    if string.str_eql(s.backend, "lldb") {
+    if util.eq[ref u8, StringView](s.backend, "lldb") {
         lldb.run(s.lldb_session, s.args)
         if s.lldb_session.exited {
             send_exited(s, s.lldb_session.exit_code)
         } else {
-            send_stopped(s, "breakpoint")
+            send_stopped(s, c"breakpoint")
         }
     } else {
         val lr = native.launch(s.native_session, s.args)
         match lr {
             err e => {
-                send_event_error(s, "launch", e)
+                send_event_error(s, c"launch", e)
                 return
             }
             ok _ => {
@@ -638,7 +683,7 @@ fn start_program(s: mut ref DapState) void = trust {
                 if s.native_session.exited {
                     send_exited(s, s.native_session.exit_code)
                 } else {
-                    send_stopped(s, "breakpoint")
+                    send_stopped(s, c"breakpoint")
                 }
             }
         }
@@ -646,51 +691,51 @@ fn start_program(s: mut ref DapState) void = trust {
 }
 
 fn send_event_error(s: mut ref DapState, source: ref u8, message: ref u8) void = trust {
-    val b: json.JsonBuilder = json.builder_new()
-    val body: ref void = json.build_object(b)
-    obj_add_str(b, body, "category", "stderr")
-    obj_add_str(b, body, "output", @fmtalloc("phantom: {s}: {s}\n", {source, message}))
-    send_event(s, "output", body)
+    val b: json.JsonBuilder = new_builder()
+    val body: json.JsonValue = json.build_object(b)
+    obj_add_str(b, body, c"category", c"stderr")
+    obj_add_str(b, body, c"output", @fmtalloc(c"phantom: {s}: {s}\n", {source, message}))
+    send_event(s, c"output", body)
     json.builder_free(b)
 }
 
 fn handle_threads(s: mut ref DapState, req_seq: i64) void = trust {
-    val b: json.JsonBuilder = json.builder_new()
-    val body: ref void = json.build_object(b)
-    val arr: ref void = json.build_array(b)
-    val th: ref void = json.build_object(b)
-    obj_add_int(b, th, "id", 1)
-    obj_add_str(b, th, "name", "main")
+    val b: json.JsonBuilder = new_builder()
+    val body: json.JsonValue = json.build_object(b)
+    val arr: json.JsonValue = json.build_array(b)
+    val th: json.JsonValue = json.build_object(b)
+    obj_add_int(b, th, c"id", 1)
+    obj_add_str(b, th, c"name", c"main")
     json.array_append(arr, th)
-    obj_add_obj(b, body, "threads", arr)
-    send_response(s, req_seq, "threads", true, body)
+    obj_add_obj(b, body, c"threads", arr)
+    send_response(s, req_seq, c"threads", true, body)
     json.builder_free(b)
 }
 
 fn handle_continue(s: mut ref DapState, req_seq: i64) void = trust {
-    val b: json.JsonBuilder = json.builder_new()
-    val body: ref void = json.build_object(b)
-    obj_add_bool(b, body, "allThreadsContinued", true)
-    send_response(s, req_seq, "continue", true, body)
+    val b: json.JsonBuilder = new_builder()
+    val body: json.JsonValue = json.build_object(b)
+    obj_add_bool(b, body, c"allThreadsContinued", true)
+    send_response(s, req_seq, c"continue", true, body)
     json.builder_free(b)
-    if string.str_eql(s.backend, "lldb") {
+    if util.eq[ref u8, StringView](s.backend, "lldb") {
         lldb.cont(s.lldb_session)
         if s.lldb_session.exited {
             send_exited(s, s.lldb_session.exit_code)
         } else {
-            send_stopped(s, "breakpoint")
+            send_stopped(s, c"breakpoint")
         }
     } else {
         val cr = native.cont(s.native_session)
         match cr {
             err e => {
-                send_event_error(s, "continue", e)
+                send_event_error(s, c"continue", e)
             }
             ok _ => {
                 if s.native_session.exited {
                     send_exited(s, s.native_session.exit_code)
                 } else {
-                    send_stopped(s, "breakpoint")
+                    send_stopped(s, c"breakpoint")
                 }
             }
         }
@@ -698,13 +743,13 @@ fn handle_continue(s: mut ref DapState, req_seq: i64) void = trust {
 }
 
 fn handle_step(s: mut ref DapState, req_seq: i64, command: ref u8) void = trust {
-    if !string.str_eql(s.backend, "lldb") {
-        send_error(s, req_seq, command, "source-level stepping is not implemented in the native backend")
+    if !util.eq[ref u8, StringView](s.backend, "lldb") {
+        send_error(s, req_seq, command, c"source-level stepping is not implemented in the native backend")
         return
     }
-    if string.str_eql(command, "next") {
+    if util.eq[_, _](command, "next") {
         lldb.next(s.lldb_session)
-    } elif string.str_eql(command, "stepIn") {
+    } elif util.eq[_, _](command, "stepIn") {
         lldb.step(s.lldb_session)
     } else {
         lldb.finish(s.lldb_session)
@@ -713,124 +758,124 @@ fn handle_step(s: mut ref DapState, req_seq: i64, command: ref u8) void = trust 
     if s.lldb_session.exited {
         send_exited(s, s.lldb_session.exit_code)
     } else {
-        send_stopped(s, "step")
+        send_stopped(s, c"step")
     }
 }
 
 fn handle_stack_trace(s: mut ref DapState, req_seq: i64) void = trust {
-    val b: json.JsonBuilder = json.builder_new()
-    val body: ref void = json.build_object(b)
-    val arr: ref void = json.build_array(b)
-    if string.str_eql(s.backend, "lldb") && s.lldb_session != none {
+    val b: json.JsonBuilder = new_builder()
+    val body: json.JsonValue = json.build_object(b)
+    val arr: json.JsonValue = json.build_array(b)
+    if util.eq[ref u8, StringView](s.backend, "lldb") && s.lldb_session != none {
         val frames: list[ref lldb.LldbFrame] = lldb.parse_frames(s.lldb_session.last_output)
         for f in frames {
-            val fr: ref void = json.build_object(b)
-            obj_add_int(b, fr, "id", f.index)
-            obj_add_str(b, fr, "name", f.function_display)
-            obj_add_int(b, fr, "line", f.line)
-            obj_add_int(b, fr, "column", f.column)
-            obj_add_str(b, fr, "instructionPointerReference", @fmtalloc("0x{x}", {f.address}))
-            if string.len_raw(f.file) > 0 {
-                val src: ref void = json.build_object(b)
-                obj_add_str(b, src, "name", util.basename(f.file))
-                obj_add_str(b, src, "path", f.file)
-                obj_add_obj(b, fr, "source", src)
+            val fr: json.JsonValue = json.build_object(b)
+            obj_add_int(b, fr, c"id", f.index)
+            obj_add_str(b, fr, c"name", f.function_display)
+            obj_add_int(b, fr, c"line", f.line)
+            obj_add_int(b, fr, c"column", f.column)
+            obj_add_str(b, fr, c"instructionPointerReference", @fmtalloc(c"0x{x}", {f.address}))
+            if util.len_raw[ref u8](f.file) > 0 {
+                val src: json.JsonValue = json.build_object(b)
+                obj_add_str(b, src, c"name", util.basename[ref u8](f.file))
+                obj_add_str(b, src, c"path", f.file)
+                obj_add_obj(b, fr, c"source", src)
             }
             json.array_append(arr, fr)
         }
     } elif s.native_session != none && s.native_session.stopped {
-        val fr: ref void = json.build_object(b)
-        obj_add_int(b, fr, "id", 0)
-        obj_add_str(b, fr, "name", native.current_function_name(s.native_session))
+        val fr: json.JsonValue = json.build_object(b)
+        obj_add_int(b, fr, c"id", 0)
+        obj_add_str(b, fr, c"name", native.current_function_name(s.native_session))
         val loc: ref u8 = native.current_location(s.native_session)
         val colon: i64 = last_colon(loc)
         if colon > 0 {
-            val line_opt = util.parse_i64(@ptradd(loc, colon + 1))
+            val line_opt = util.parse_i64[ref u8](@ptradd(loc, colon + 1))
             if line_opt is some line {
-                obj_add_int(b, fr, "line", line)
+                obj_add_int(b, fr, c"line", line)
             }
             val file: ref u8 = util.copy_cstr_len(loc, colon)
-            val src: ref void = json.build_object(b)
-            obj_add_str(b, src, "name", util.basename(file))
-            obj_add_str(b, src, "path", file)
-            obj_add_obj(b, fr, "source", src)
+            val src: json.JsonValue = json.build_object(b)
+            obj_add_str(b, src, c"name", util.basename[_](file))
+            obj_add_str(b, src, c"path", file)
+            obj_add_obj(b, fr, c"source", src)
         }
-        obj_add_str(b, fr, "instructionPointerReference", @fmtalloc("0x{x}", {s.native_session.regs.rip}))
+        obj_add_str(b, fr, c"instructionPointerReference", @fmtalloc(c"0x{x}", {s.native_session.regs.rip}))
         json.array_append(arr, fr)
     }
-    obj_add_obj(b, body, "stackFrames", arr)
-    obj_add_int(b, body, "totalFrames", json.arr_len(arr) as i64)
-    send_response(s, req_seq, "stackTrace", true, body)
+    obj_add_obj(b, body, c"stackFrames", arr)
+    obj_add_int(b, body, c"totalFrames", json.len(arr) as i64)
+    send_response(s, req_seq, c"stackTrace", true, body)
     json.builder_free(b)
 }
 
 fn handle_scopes(s: mut ref DapState, req_seq: i64) void = trust {
-    val b: json.JsonBuilder = json.builder_new()
-    val body: ref void = json.build_object(b)
-    val arr: ref void = json.build_array(b)
-    val sc: ref void = json.build_object(b)
-    obj_add_str(b, sc, "name", "Locals")
-    obj_add_int(b, sc, "variablesReference", 1001)
-    obj_add_bool(b, sc, "expensive", false)
+    val b: json.JsonBuilder = new_builder()
+    val body: json.JsonValue = json.build_object(b)
+    val arr: json.JsonValue = json.build_array(b)
+    val sc: json.JsonValue = json.build_object(b)
+    obj_add_str(b, sc, c"name", c"Locals")
+    obj_add_int(b, sc, c"variablesReference", 1001)
+    obj_add_bool(b, sc, c"expensive", false)
     json.array_append(arr, sc)
-    obj_add_obj(b, body, "scopes", arr)
-    send_response(s, req_seq, "scopes", true, body)
+    obj_add_obj(b, body, c"scopes", arr)
+    send_response(s, req_seq, c"scopes", true, body)
     json.builder_free(b)
 }
 
 fn handle_variables(s: mut ref DapState, req_seq: i64) void = trust {
-    val b: json.JsonBuilder = json.builder_new()
-    val body: ref void = json.build_object(b)
-    val arr: ref void = json.build_array(b)
-    if string.str_eql(s.backend, "lldb") && s.lldb_session != none {
+    val b: json.JsonBuilder = new_builder()
+    val body: json.JsonValue = json.build_object(b)
+    val arr: json.JsonValue = json.build_array(b)
+    if util.eq[ref u8, StringView](s.backend, "lldb") && s.lldb_session != none {
         val vars: list[ref lldb.LldbVar] = lldb.parse_variables(lldb.clean_output(lldb.frame_variables(s.lldb_session)))
         for v in vars {
-            val vr: ref void = json.build_object(b)
-            obj_add_str(b, vr, "name", v.name)
-            obj_add_str(b, vr, "value", v.value)
-            obj_add_str(b, vr, "type", v.type_name)
-            obj_add_int(b, vr, "variablesReference", 0)
+            val vr: json.JsonValue = json.build_object(b)
+            obj_add_str(b, vr, c"name", v.name)
+            obj_add_str(b, vr, c"value", v.value)
+            obj_add_str(b, vr, c"type", v.type_name)
+            obj_add_int(b, vr, c"variablesReference", 0)
             json.array_append(arr, vr)
         }
     } elif s.native_session != none && s.native_session.current_function != none {
         for v in s.native_session.current_function.variables {
-            val vr2: ref void = json.build_object(b)
-            obj_add_str(b, vr2, "name", v.source_name)
-            obj_add_str(b, vr2, "value", native.read_expression(s.native_session, v.source_name))
-            obj_add_str(b, vr2, "type", native.type_name(s.native_session, v.type_off))
-            obj_add_int(b, vr2, "variablesReference", 0)
+            val vr2: json.JsonValue = json.build_object(b)
+            obj_add_str(b, vr2, c"name", v.source_name)
+            obj_add_str(b, vr2, c"value", native.read_expression(s.native_session, v.source_name))
+            obj_add_str(b, vr2, c"type", native.type_name(s.native_session, v.type_off))
+            obj_add_int(b, vr2, c"variablesReference", 0)
             json.array_append(arr, vr2)
         }
     }
-    obj_add_obj(b, body, "variables", arr)
-    send_response(s, req_seq, "variables", true, body)
+    obj_add_obj(b, body, c"variables", arr)
+    send_response(s, req_seq, c"variables", true, body)
     json.builder_free(b)
 }
 
-fn handle_evaluate(s: mut ref DapState, req_seq: i64, args: ref void) void = trust {
-    val expr: mut ref u8 = ""
+fn handle_evaluate(s: mut ref DapState, req_seq: i64, args: json.JsonValue) void = trust {
+    val expr: mut ref u8 = c""
     if args != none {
-        val e_opt = json.obj_get_str(args, "expression")
+        val e_opt = json.object_get_str(args, "expression")
         if e_opt is some e {
             expr = e as ref u8
         }
     }
-    val result: mut ref u8 = ""
-    if string.str_eql(s.backend, "lldb") && s.lldb_session != none {
+    val result: mut ref u8 = c""
+    if util.eq[ref u8, StringView](s.backend, "lldb") && s.lldb_session != none {
         val rewritten: ref u8 = lldb.rewrite_expression(s.lldb_session, expr)
         result = lldb.clean_output(lldb.expression(s.lldb_session, rewritten))
     } elif s.native_session != none {
         result = native.read_expression(s.native_session, expr)
     }
-    if string.len_raw(result) == 0 {
-        send_error(s, req_seq, "evaluate", "expression could not be evaluated")
+    if util.len_raw[_](result) == 0 {
+        send_error(s, req_seq, c"evaluate", c"expression could not be evaluated")
         return
     }
-    val b: json.JsonBuilder = json.builder_new()
-    val body: ref void = json.build_object(b)
-    obj_add_str(b, body, "result", result)
-    obj_add_int(b, body, "variablesReference", 0)
-    send_response(s, req_seq, "evaluate", true, body)
+    val b: json.JsonBuilder = new_builder()
+    val body: json.JsonValue = json.build_object(b)
+    obj_add_str(b, body, c"result", result)
+    obj_add_int(b, body, c"variablesReference", 0)
+    send_response(s, req_seq, c"evaluate", true, body)
     json.builder_free(b)
 }
 
@@ -841,11 +886,11 @@ fn handle_disconnect(s: mut ref DapState, req_seq: i64) void = trust {
     if s.native_session != none {
         native.quit(s.native_session)
     }
-    send_response(s, req_seq, "disconnect", true, none)
+    send_response(s, req_seq, c"disconnect", true, none)
 }
 
 fn last_colon(s: ref u8) i64 = trust {
-    val n: i64 = string.len_raw(s)
+    val n: i64 = util.len_raw[_](s)
     val i: mut i64 = n - 1
     for {
         if i < 0 {
@@ -860,63 +905,66 @@ fn last_colon(s: ref u8) i64 = trust {
 }
 
 fn dispatch(s: mut ref DapState, packet: ref u8) void = trust {
-    val doc_opt = json.parse(packet)
+    val doc_opt = json.parse(string.from_cstr(packet))
     val doc: mut json.JsonDoc = {ptr: none}
-    if doc_opt is some dv {
-        doc = dv as json.JsonDoc
-    } else {
-        return
+    match doc_opt {
+        ok dv => {
+            doc = dv
+        }
+        err _ => {
+            return
+        }
     }
-    val root: ref void = json.doc_root(doc)
-    if !json.val_is_object(root) {
+    val root: json.JsonValue = json.root(doc)
+    if !json.is_object(root) {
         json.doc_free(doc)
         return
     }
-    val cmd_opt = json.obj_get_str(root, "command")
-    val seq_opt = json.obj_get_int(root, "seq")
-    val cmd: mut ref u8 = "unknown"
+    val cmd_opt = json.object_get_str(root, "command")
+    val seq_opt = json.object_get_int(root, "seq")
+    val cmd: mut ref u8 = c"unknown"
     if cmd_opt is some c {
-        cmd = c as ref u8
+        cmd = util.copy_cstr[StringView](c)
     }
     val req_seq: mut i64 = 0
     if seq_opt is some q {
         req_seq = q
     }
-    val args_opt = json.obj_get(root, "arguments")
-    val args: mut ref void = none
+    val args_opt = json.object_get(root, "arguments")
+    val args: mut json.JsonValue = nil_json()
     if args_opt is some a {
-        args = a as ref void
+        args = a
     }
 
-    if string.str_eql(cmd, "initialize") {
+    if util.eq[_, _](cmd, "initialize") {
         handle_initialize(s, req_seq)
-    } elif string.str_eql(cmd, "launch") {
+    } elif util.eq[_, _](cmd, "launch") {
         handle_launch(s, req_seq, args)
-    } elif string.str_eql(cmd, "setBreakpoints") {
+    } elif util.eq[_, _](cmd, "setBreakpoints") {
         handle_set_breakpoints(s, req_seq, args)
-    } elif string.str_eql(cmd, "setFunctionBreakpoints") {
+    } elif util.eq[_, _](cmd, "setFunctionBreakpoints") {
         handle_set_function_breakpoints(s, req_seq, args)
-    } elif string.str_eql(cmd, "configurationDone") {
+    } elif util.eq[_, _](cmd, "configurationDone") {
         handle_configuration_done(s, req_seq)
-    } elif string.str_eql(cmd, "threads") {
+    } elif util.eq[_, _](cmd, "threads") {
         handle_threads(s, req_seq)
-    } elif string.str_eql(cmd, "continue") {
+    } elif util.eq[_, _](cmd, "continue") {
         handle_continue(s, req_seq)
-    } elif string.str_eql(cmd, "next") || string.str_eql(cmd, "stepIn") ||
-    string.str_eql(cmd, "stepOut") {
+    } elif util.eq[_, _](cmd, "next") || util.eq[_, _](cmd, "stepIn") ||
+    util.eq[_, _](cmd, "stepOut") {
         handle_step(s, req_seq, cmd)
-    } elif string.str_eql(cmd, "stackTrace") {
+    } elif util.eq[_, _](cmd, "stackTrace") {
         handle_stack_trace(s, req_seq)
-    } elif string.str_eql(cmd, "scopes") {
+    } elif util.eq[_, _](cmd, "scopes") {
         handle_scopes(s, req_seq)
-    } elif string.str_eql(cmd, "variables") {
+    } elif util.eq[_, _](cmd, "variables") {
         handle_variables(s, req_seq)
-    } elif string.str_eql(cmd, "evaluate") {
+    } elif util.eq[_, _](cmd, "evaluate") {
         handle_evaluate(s, req_seq, args)
-    } elif string.str_eql(cmd, "disconnect") {
+    } elif util.eq[_, _](cmd, "disconnect") {
         handle_disconnect(s, req_seq)
-    } elif string.str_eql(cmd, "setExceptionBreakpoints") ||
-    string.str_eql(cmd, "setVariable") || string.str_eql(cmd, "source") {
+    } elif util.eq[_, _](cmd, "setExceptionBreakpoints") ||
+    util.eq[_, _](cmd, "setVariable") || util.eq[_, _](cmd, "source") {
         send_response(s, req_seq, cmd, true, none)
     } else {
         send_error(s, req_seq, cmd, @fmtalloc("unsupported request '{s}'", {cmd}))
@@ -938,7 +986,7 @@ pub fn run(
     s.backend = backend
     s.compiler = compiler
     s.program = program_override
-    s.program_set = string.len_raw(program_override) > 0
+    s.program_set = util.len_raw[_](program_override) > 0
     s.args = initial_args
     s.initialized = false
     s.configured = false
@@ -949,7 +997,7 @@ pub fn run(
     s.metadata = none
     s.bp_files = @listalloc[allocators.HeapAllocator, ref u8](util.heap())?
     s.bp_lines = @listalloc[allocators.HeapAllocator, i64](util.heap())?
-    s.stop_reason = "breakpoint"
+    s.stop_reason = c"breakpoint"
 
     for {
         val pkt_opt = read_packet()

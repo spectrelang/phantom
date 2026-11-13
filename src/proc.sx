@@ -3,7 +3,6 @@
 /// (C) Navid Momtahen - 2026
 /// SPDX-License-Identifier: GPL-3.0-only
 
-val string     = use("std/string")
 val util       = use("util.sx")
 
 when posix {
@@ -222,7 +221,7 @@ pub fn read_until(fd: i32, marker: ref u8, cap: i64) ref u8 = trust {
     }
     val buf: ref u8 = @alloc((limit + 1) as usize) as ref u8
     @memset(buf, 0, (limit + 1) as usize)
-    val mlen: i64 = string.len_raw(marker)
+    val mlen: i64 = util.len_raw[_](marker)
     val n: mut i64 = 0
     val found: mut bool = false
     for {
@@ -363,14 +362,14 @@ fn path_separator() u8 = trust {
 
 /// Find an executable in PATH. Returns none when not found.
 pub fn find_executable(name: ref u8) bool = trust {
-    val path_opt = env_get("PATH")
+    val path_opt = env_get(c"PATH")
     val path: mut ref u8 = none
     if path_opt is some pv {
         path = pv as ref u8
     } else {
         return false
     }
-    val n: i64 = string.len_raw(path)
+    val n: i64 = util.len_raw[_](path)
     val start: mut i64 = 0
     val sep: u8 = path_separator()
     val i: mut i64 = 0

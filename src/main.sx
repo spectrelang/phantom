@@ -4,7 +4,6 @@
 /// SPDX-License-Identifier: GPL-3.0-only
 
 val stdio      = use("std/stdio")
-val string     = use("std/string")
 val os         = use("std/os")
 val fs         = use("std/fs")
 val allocators = use("std/allocators")
@@ -16,19 +15,19 @@ val demangle   = use("demangle.sx")
 val elf        = use("elf.sx")
 val dwarf      = use("dwarf.sx")
 
-val VERSION: ref u8 = "0.1.0"
+val VERSION: ref u8 = c"0.1.0"
 
 fn arg_at(args: list[ref u8], index: i64) ref u8 = trust {
     val opt = @get(args, index as usize)
     if opt is some v {
         return v as ref u8
     }
-    return ""
+    return c""
 }
 
 fn strip_sx_ext(name: ref u8) ref u8 = trust {
-    if string.raw_ends_with(name, ".sx") {
-        return util.copy_cstr_len(name, string.len_raw(name) - 3)
+    if util.ends_with[_, _](name, ".sx") {
+        return util.copy_cstr_len(name, util.len_or_zero(name) - 3)
     }
     return name
 }
@@ -38,35 +37,35 @@ fn file_exists(path_in: ref u8) bool = trust {
 }
 
 fn find_compiler(explicit: ref u8) ref u8 = trust {
-    if explicit != none && string.len_raw(explicit) > 0 {
+    if explicit != none && util.len_or_zero(explicit) > 0 {
         return explicit
     }
-    val env1 = os.getenv("PHANTOM_COMPILER")
-    if env1 != none && string.len_raw(env1) > 0 {
+    val env1 = os.getenv(c"PHANTOM_COMPILER")
+    if env1 != none && util.len_or_zero(env1) > 0 {
         return env1
     }
-    val env2 = os.getenv("SPECTRE_COMPILER")
-    if env2 != none && string.len_raw(env2) > 0 {
+    val env2 = os.getenv(c"SPECTRE_COMPILER")
+    if env2 != none && util.len_or_zero(env2) > 0 {
         return env2
     }
-    if os.in_path("spectre-dev") {
-        return "spectre-dev"
+    if os.in_path(c"spectre-dev") {
+        return c"spectre-dev"
     }
-    if os.in_path("spectre") {
-        return "spectre"
+    if os.in_path(c"spectre") {
+        return c"spectre"
     }
-    if file_exists("../spectre/spectre-dev") {
-        return "../spectre/spectre-dev"
+    if file_exists(c"../spectre/spectre-dev") {
+        return c"../spectre/spectre-dev"
     }
-    if file_exists("../spectre/spectre") {
-        return "../spectre/spectre"
+    if file_exists(c"../spectre/spectre") {
+        return c"../spectre/spectre"
     }
-    return "spectre"
+    return c"spectre"
 }
 
 fn build_source(compiler: ref u8, source: ref u8) result[ref u8, ref u8] = trust {
-    val base: ref u8 = strip_sx_ext(util.basename(source))
-    val tmp: ref u8 = fs.temp_dir_raw()
+    val base: ref u8 = strip_sx_ext(util.basename[_](source))
+    val tmp: ref u8 = fs.temp_dir_cstr()
     val out: ref u8 = @fmtalloc("{s}/phantom-{d}-{s}", {tmp, native_pid(), base})
     val cmd: ref u8 = @fmtalloc(
         "{s} {s} -alt -no-single-flags -o {s} 2>&1",
@@ -79,7 +78,7 @@ fn build_source(compiler: ref u8, source: ref u8) result[ref u8, ref u8] = trust
         }
         ok output => {
             if !file_exists(out) {
-                val text: ref u8 = string.cstr(output)
+                val text: ref u8 = output.ptr
                 return err @fmtalloc("build failed:\n{s}", {text})
             }
         }
@@ -128,7 +127,7 @@ type VariableRow = {
 }
 
 fn table_max(width: i64, s: ref u8) i64 = trust {
-    val n: i64 = string.len_raw(s)
+    val n: i64 = util.len_raw[_](s)
     if n > width {
         return n
     }
@@ -137,7 +136,7 @@ fn table_max(width: i64, s: ref u8) i64 = trust {
 
 fn table_field(s: ref u8, width: i64) void = trust {
     stdio.print("{s}", {s})
-    val i: mut i64 = string.len_raw(s)
+    val i: mut i64 = util.len_raw[_](s)
     for {
         if i >= width {
             break
@@ -168,7 +167,7 @@ fn symbol_row_add(
 fn symbol_rows(t: ref target.Target, query: ref u8) list[ref SymbolRow] = trust {
     val rows: mut list[ref SymbolRow] =
     @listalloc[allocators.HeapAllocator, ref SymbolRow](util.heap())?
-    if string.len_raw(query) > 0 {
+    if util.len_raw[_](query) > 0 {
         val fns: list[ref dwarf.DwarfFunction] = target.find_functions(t, query, 200)
         for f in fns {
             symbol_row_add(rows, f.display, f.name, @fmtalloc("[{x}..{x}]", {
@@ -204,9 +203,9 @@ fn print_symbol_table(rows: list[ref SymbolRow]) void = trust {
         raw_w = table_max(raw_w, r.raw)
         addr_w = table_max(addr_w, r.address)
     }
-    table_field("NAME", name_w)
-    table_field("SYMBOL", raw_w)
-    table_last("ADDRESS")
+    table_field(c"NAME", name_w)
+    table_field(c"SYMBOL", raw_w)
+    table_last(c"ADDRESS")
     for r in rows {
         table_field(r.display, name_w)
         table_field(r.raw, raw_w)
@@ -245,9 +244,9 @@ fn cmd_lines(program: ref u8, query: ref u8) i32 = trust {
             t = tv
         }
     }
-    if string.len_raw(query) == 0 {
+    if util.len_raw[_](query) == 0 {
         for row in t.dwarf_info.lines {
-            if row.is_stmt && string.len_raw(row.file) > 0 {
+            if row.is_stmt && util.len_or_zero(row.file) > 0 {
                 stdio.print("{s}:{lld} -> 0x{x}\n", {row.file, row.line, row.address})
             }
         }
@@ -256,7 +255,7 @@ fn cmd_lines(program: ref u8, query: ref u8) i32 = trust {
     val colon: i64 = last_colon(query)
     if colon > 0 {
         val file: ref u8 = util.copy_cstr_len(query, colon)
-        val line_opt = util.parse_i64(@ptradd(query, colon + 1))
+        val line_opt = util.parse_i64[ref u8](@ptradd(query, colon + 1))
         if line_opt is some line {
             val addr_opt = target.line_address(t, file, line)
             if addr_opt is some addr {
@@ -297,7 +296,7 @@ fn variable_rows(t: ref target.Target, fn_query: ref u8) list[ref VariableRow] =
     val rows: mut list[ref VariableRow] =
     @listalloc[allocators.HeapAllocator, ref VariableRow](util.heap())?
     for f in t.dwarf_info.functions {
-        if string.len_raw(fn_query) > 0 && !demangle.matches(f.name, fn_query) {
+        if util.len_raw[_](fn_query) > 0 && !demangle.matches(f.name, fn_query) {
             continue
         }
         for v in f.variables {
@@ -330,11 +329,11 @@ fn print_variable_table(rows: list[ref VariableRow]) void = trust {
         type_w = table_max(type_w, r.type_name)
         loc_w = table_max(loc_w, r.location)
     }
-    table_field("FUNCTION", fn_w)
-    table_field("SYMBOL", sym_w)
-    table_field("VARIABLE", name_w)
-    table_field("TYPE", type_w)
-    table_last("LOCATION")
+    table_field(c"FUNCTION", fn_w)
+    table_field(c"SYMBOL", sym_w)
+    table_field(c"VARIABLE", name_w)
+    table_field(c"TYPE", type_w)
+    table_last(c"LOCATION")
     for r in rows {
         table_field(r.function, fn_w)
         table_field(r.symbol, sym_w)
@@ -365,7 +364,7 @@ fn cmd_variables(program: ref u8, fn_query: ref u8) i32 = trust {
 fn type_name_of(info: ref dwarf.DwarfInfo, off: u64) ref u8 = trust {
     for t in info.types {
         if t.offset == off {
-            if t.name != none && string.len_raw(t.name) > 0 {
+            if t.name != none && util.len_or_zero(t.name) > 0 {
                 return demangle.source_name(t.name)
             }
             if t.tag == 15 {
@@ -376,11 +375,11 @@ fn type_name_of(info: ref dwarf.DwarfInfo, off: u64) ref u8 = trust {
             }
         }
     }
-    return "?"
+    return c"?"
 }
 
 fn last_colon(s: ref u8) i64 = trust {
-    val n: i64 = string.len_raw(s)
+    val n: i64 = util.len_raw[_](s)
     val i: mut i64 = n - 1
     for {
         if i < 0 {
@@ -423,7 +422,7 @@ fn prepare_program(
     input: ref u8,
     compiler: ref u8
 ) result[ref u8, ref u8] = trust {
-    if string.raw_ends_with(input, ".sx") {
+    if util.ends_with[_, _](input, ".sx") {
         return build_source(compiler, input)
     }
     if !file_exists(input) {
@@ -434,9 +433,9 @@ fn prepare_program(
 
 fn batch_trim(s: ref u8) ref u8 = trust {
     if s == none {
-        return ""
+        return c""
     }
-    val n: i64 = string.len_raw(s)
+    val n: i64 = util.len_raw[_](s)
     val start: mut i64 = 0
     for {
         if start >= n {
@@ -468,7 +467,7 @@ fn batch_add_text(commands: mut list[ref u8], text: ref u8) void = trust {
     if text == none {
         return
     }
-    val n: i64 = string.len_raw(text)
+    val n: i64 = util.len_raw[_](text)
     val pos: mut i64 = 0
     for {
         if pos >= n {
@@ -482,7 +481,7 @@ fn batch_add_text(commands: mut list[ref u8], text: ref u8) void = trust {
             end++
         }
         val line: ref u8 = batch_trim(util.copy_cstr_len(@ptradd(text, pos), end - pos))
-        if string.len_raw(line) > 0 && @load8(line) != 35 {
+        if util.len_raw[_](line) > 0 && @load8(line) != 35 {
             @append(commands, line)
         }
         pos = end + 1
@@ -490,7 +489,7 @@ fn batch_add_text(commands: mut list[ref u8], text: ref u8) void = trust {
 }
 
 fn batch_add_file(commands: mut list[ref u8], path: ref u8) bool = trust {
-    val data_opt = fs.read_all_raw(path)
+    val data_opt = fs.read_all_heap_cstr(path)
     if data_opt is some dv {
         batch_add_text(commands, dv as ref u8)
         return true
@@ -506,32 +505,32 @@ pub fn main() i32 = trust {
         return 1
     }
     val first: ref u8 = arg_at(args, 1)
-    if string.str_eql(first, "help") || string.str_eql(first, "-h") ||
-    string.str_eql(first, "--help") {
+    if util.eq[_, _](first, "help") || util.eq[_, _](first, "-h") ||
+    util.eq[_, _](first, "--help") {
         usage()
         return 0
     }
-    if string.str_eql(first, "version") || string.str_eql(first, "-v") ||
-    string.str_eql(first, "--version") {
+    if util.eq[_, _](first, "version") || util.eq[_, _](first, "-v") ||
+    util.eq[_, _](first, "--version") {
         stdio.print("phantom {s}\n", {VERSION})
         return 0
     }
 
-    if string.str_eql(first, "symbols") {
+    if util.eq[_, _](first, "symbols") {
         if argc < 3 {
             stdio.puts("usage: phantom symbols <binary> [query]")
             return 1
         }
         return cmd_symbols(arg_at(args, 2), arg_at(args, 3))
     }
-    if string.str_eql(first, "lines") {
+    if util.eq[_, _](first, "lines") {
         if argc < 3 {
             stdio.puts("usage: phantom lines <binary> [file:line]")
             return 1
         }
         return cmd_lines(arg_at(args, 2), arg_at(args, 3))
     }
-    if string.str_eql(first, "variables") {
+    if util.eq[_, _](first, "variables") {
         if argc < 3 {
             stdio.puts("usage: phantom variables <binary> [function]")
             return 1
@@ -539,31 +538,31 @@ pub fn main() i32 = trust {
         return cmd_variables(arg_at(args, 2), arg_at(args, 3))
     }
 
-    if string.str_eql(first, "build") {
+    if util.eq[_, _](first, "build") {
         val source: ref u8 = arg_at(args, 2)
-        if string.len_raw(source) == 0 {
+        if util.len_raw[_](source) == 0 {
             stdio.puts("usage: phantom build <file.sx> [-o <output>]")
             return 1
         }
-        val compiler: mut ref u8 = ""
-        val output: mut ref u8 = ""
+        val compiler: mut ref u8 = c""
+        val output: mut ref u8 = c""
         val i: mut i64 = 3
         for {
             if i >= argc {
                 break
             }
             val a: ref u8 = arg_at(args, i)
-            if string.str_eql(a, "--compiler") {
+            if util.eq[_, _](a, "--compiler") {
                 i++
                 compiler = arg_at(args, i)
-            } elif string.str_eql(a, "-o") || string.str_eql(a, "--output") {
+            } elif util.eq[_, _](a, "-o") || util.eq[_, _](a, "--output") {
                 i++
                 output = arg_at(args, i)
             }
             i++
         }
         val comp: ref u8 = find_compiler(compiler)
-        if string.len_raw(output) > 0 {
+        if util.len_raw[_](output) > 0 {
             val cmd: ref u8 = @fmtalloc(
                 "{s} {s} -alt -no-single-flags -o {s} 2>&1",
                 {comp, source, output}
@@ -575,8 +574,8 @@ pub fn main() i32 = trust {
                     return 1
                 }
                 ok text => {
-                    val out_text: ref u8 = string.cstr(text)
-                    if string.len_raw(out_text) > 0 {
+                    val out_text: ref u8 = text.ptr
+                    if util.len_raw[_](out_text) > 0 {
                         stdio.print("{s}\n", {out_text})
                     }
                     if file_exists(output) {
@@ -600,12 +599,12 @@ pub fn main() i32 = trust {
         }
     }
 
-    val is_dap: bool = string.str_eql(first, "dap")
-    val is_debug: bool = string.str_eql(first, "debug")
-    val input: mut ref u8 = ""
-    val backend: mut ref u8 = "lldb"
-    val compiler: mut ref u8 = ""
-    val program_override: mut ref u8 = ""
+    val is_dap: bool = util.eq[_, _](first, "dap")
+    val is_debug: bool = util.eq[_, _](first, "debug")
+    val input: mut ref u8 = c""
+    val backend: mut ref u8 = c"lldb"
+    val compiler: mut ref u8 = c""
+    val program_override: mut ref u8 = c""
     val prog_args: mut list[ref u8] = @listalloc[allocators.HeapAllocator, ref u8](util.heap())?
     val batch: mut bool = false
     val batch_commands: mut list[ref u8] = @listalloc[allocators.HeapAllocator, ref u8](util.heap())?
@@ -621,48 +620,48 @@ pub fn main() i32 = trust {
         val a: ref u8 = arg_at(args, i)
         if saw_separator {
             @append(prog_args, a)
-        } elif string.str_eql(a, "--") {
+        } elif util.eq[_, _](a, "--") {
             saw_separator = true
-        } elif string.str_eql(a, "-backend") || string.str_eql(a, "-b") {
+        } elif util.eq[_, _](a, "-backend") || util.eq[_, _](a, "-b") {
             i++
             backend = arg_at(args, i)
-        } elif string.str_eql(a, "-compiler") {
+        } elif util.eq[_, _](a, "-compiler") {
             i++
             compiler = arg_at(args, i)
-        } elif string.str_eql(a, "-program") {
+        } elif util.eq[_, _](a, "-program") {
             i++
             program_override = arg_at(args, i)
-        } elif string.str_eql(a, "-batch") || string.str_eql(a, "--batch") {
+        } elif util.eq[_, _](a, "-batch") || util.eq[_, _](a, "--batch") {
             batch = true
-        } elif string.str_eql(a, "-ex") || string.str_eql(a, "--eval-command") {
+        } elif util.eq[_, _](a, "-ex") || util.eq[_, _](a, "--eval-command") {
             i++
             val command: ref u8 = batch_trim(arg_at(args, i))
-            if string.len_raw(command) > 0 {
+            if util.len_raw[_](command) > 0 {
                 @append(batch_commands, command)
             }
-        } elif string.raw_starts_with(a, "--eval-command=") {
+        } elif util.starts_with[_, _](a, "--eval-command=") {
             val command: ref u8 = batch_trim(
-                @ptradd(a, string.len_raw("--eval-command="))
+                @ptradd(a, util.len_raw[_]("--eval-command="))
             )
-            if string.len_raw(command) > 0 {
+            if util.len_raw[_](command) > 0 {
                 @append(batch_commands, command)
             }
-        } elif string.str_eql(a, "-x") || string.str_eql(a, "-command") {
+        } elif util.eq[_, _](a, "-x") || util.eq[_, _](a, "-command") {
             i++
             val path: ref u8 = arg_at(args, i)
             if !batch_add_file(batch_commands, path) {
                 stdio.print("phantom: cannot read command file '{s}'\n", {path})
                 return 1
             }
-        } elif string.raw_starts_with(a, "-command=") {
-            val path: ref u8 = @ptradd(a, string.len_raw("-command="))
+        } elif util.starts_with[_, _](a, "-command=") {
+            val path: ref u8 = @ptradd(a, util.len_raw[_]("-command="))
             if !batch_add_file(batch_commands, path) {
                 stdio.print("phantom: cannot read command file '{s}'\n", {path})
                 return 1
             }
         } else {
             if !is_dap {
-                if string.len_raw(input) == 0 {
+                if util.len_raw[_](input) == 0 {
                     input = a
                 } else {
                     @append(prog_args, a)
@@ -675,13 +674,13 @@ pub fn main() i32 = trust {
     if is_dap {
         return dap.run(comp, backend, program_override, prog_args)
     }
-    if string.len_raw(input) == 0 {
+    if util.len_raw[_](input) == 0 {
         stdio.puts("usage: phantom [options] <file.sx|binary> [-- args...]")
         stdio.puts("       phantom debug <file.sx|binary> [options] [-- args...]")
         return 1
     }
     val prog = prepare_program(input, comp)
-    val program: mut ref u8 = ""
+    val program: mut ref u8 = c""
     match prog {
         err e => {
             stdio.print("phantom: {s}\n", {e})
@@ -696,8 +695,8 @@ pub fn main() i32 = trust {
     val t: mut ref target.Target = none
     match t_opt {
         err e => {
-            if string.str_eql(backend, "native") || string.str_eql(backend, "dwarf") ||
-            string.str_eql(backend, "ptrace") {
+            if util.eq[_, _](backend, "native") || util.eq[_, _](backend, "dwarf") ||
+            util.eq[_, _](backend, "ptrace") {
                 stdio.print("phantom: {s}\n", {e})
                 return 1
             }
@@ -713,12 +712,12 @@ pub fn main() i32 = trust {
 test "batch commands trim whitespace and skip comments" {
     trust {
         val commands: mut list[ref u8] = @listalloc[allocators.HeapAllocator, ref u8](util.heap())?
-        batch_add_text(commands, "# comment\n\n  break main \t\nrun\n")
+        batch_add_text(commands, c"# comment\n\n  break main \t\nrun\n")
         assert (@len(commands) as i64) == 2
         val first = @get(commands, 0)
         match first {
             some v => {
-                assert string.str_eql(v as ref u8, "break main")
+                assert util.eq[_, _](v as ref u8, "break main")
             }
             none => {
                 assert false
@@ -727,7 +726,7 @@ test "batch commands trim whitespace and skip comments" {
         val second = @get(commands, 1)
         match second {
             some v => {
-                assert string.str_eql(v as ref u8, "run")
+                assert util.eq[_, _](v as ref u8, "run")
             }
             none => {
                 assert false
@@ -738,7 +737,7 @@ test "batch commands trim whitespace and skip comments" {
 
 test "batch trim handles empty and padded input" {
     trust {
-        assert string.str_eql(batch_trim("   "), "")
-        assert string.str_eql(batch_trim("  next  "), "next")
+        assert util.eq[ref u8, ref u8](batch_trim(c"   "), c"")
+        assert util.eq[ref u8, ref u8](batch_trim(c"  next  "), c"next")
     }
 }

@@ -4,7 +4,6 @@
 /// SPDX-License-Identifier: GPL-3.0-only
 
 val fs         = use("std/fs")
-val string     = use("std/string")
 val allocators = use("std/allocators")
 val util       = use("util.sx")
 
@@ -63,7 +62,7 @@ pub fn load(
     arena: allocators.Arena,
     path: ref u8
 ) result[ref ElfFile, ref u8] = trust {
-    val size_opt = fs.file_size(path)
+    val size_opt = fs.file_size_cstr(path)
     val sz: mut i64 = 0
     if size_opt is some szv {
         sz = szv as i64
@@ -73,7 +72,7 @@ pub fn load(
     if sz < 64 {
         return err @fmtalloc("'{s}' is not an ELF file", {path})
     }
-    val data_opt = fs.read_all[allocators.Arena](arena, path)
+    val data_opt = fs.read_all_cstr[allocators.Arena](arena, path)
     val data: mut ref u8 = none
     if data_opt is some dv {
         data = dv as ref u8
@@ -181,7 +180,7 @@ pub fn get_section(e: ref ElfFile, index: i64) option[ref ElfSection] = trust {
 /// Return a section by name, or none.
 pub fn section_by_name(e: ref ElfFile, name: ref u8) option[ref ElfSection] = trust {
     for s in e.sections {
-        if s.name != none && string.str_eql(s.name, name) {
+        if s.name != none && util.eq[ref u8, ref u8](s.name, name) {
             return some s
         }
     }
@@ -194,7 +193,7 @@ pub fn section_data(e: ref ElfFile, sec: ref ElfSection) ref u8 = trust {
 }
 
 fn load_symbols(e: mut ref ElfFile, arena: allocators.Arena) void = trust {
-    val sym_opt = section_by_name(e, ".symtab")
+    val sym_opt = section_by_name(e, c".symtab")
     val symtab: mut ref ElfSection = none
     if sym_opt is some sv {
         symtab = sv as ref ElfSection
@@ -271,7 +270,7 @@ pub fn symbol_is_data(s: ref ElfSymbol) bool = trust {
 /// Find the first symbol with an exact raw name.
 pub fn symbol_by_name(e: ref ElfFile, name: ref u8) option[ref ElfSymbol] = trust {
     for s in e.symbols {
-        if string.str_eql(s.name, name) {
+        if util.eq[ref u8, ref u8](s.name, name) {
             return some s
         }
     }
@@ -323,7 +322,7 @@ pub fn runtime_bias(e: ref ElfFile, maps_path: ref u8) u64 = trust {
     if e.etype != 3 {
         return 0
     }
-    val size_opt = fs.file_size(maps_path)
+    val size_opt = fs.file_size_cstr(maps_path)
     val sz: mut i64 = 0
     if size_opt is some szv {
         sz = szv as i64
@@ -332,7 +331,7 @@ pub fn runtime_bias(e: ref ElfFile, maps_path: ref u8) u64 = trust {
     }
     // Parse /proc/<pid>/maps for the first executable mapping of this binary.
     val arena: allocators.Arena = allocators.Arena.new((sz + 4096) as usize)?
-    val data_opt = fs.read_all[allocators.Arena](arena, maps_path)
+    val data_opt = fs.read_all_cstr[allocators.Arena](arena, maps_path)
     val data: mut ref u8 = none
     if data_opt is some dv {
         data = dv as ref u8
@@ -368,7 +367,7 @@ pub fn runtime_bias(e: ref ElfFile, maps_path: ref u8) u64 = trust {
         }
         if dash > pos {
             val start_txt: ref u8 = util.copy_cstr_len(@ptradd(data, pos), dash - pos)
-            val start_addr_opt = util.parse_u64_hex(start_txt)
+            val start_addr_opt = util.parse_u64_hex[_](start_txt)
             if start_addr_opt is some start_addr {
                 // If the mapping belongs to our binary, use its start address.
                 val path_start: mut i64 = line_end
@@ -388,7 +387,7 @@ pub fn runtime_bias(e: ref ElfFile, maps_path: ref u8) u64 = trust {
                         @ptradd(data, path_start),
                         line_end - path_start
                     )
-                    if util.ends_with(map_path, util.basename(e.path)) {
+                    if util.ends_with[ref u8, ref u8](map_path, util.basename[ref u8](e.path)) {
                         base = start_addr
                         break
                     }

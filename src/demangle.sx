@@ -3,7 +3,6 @@
 /// (C) Navid Momtahen - 2026
 /// SPDX-License-Identifier: GPL-3.0-only
 
-val string = use("std/string")
 val util   = use("util.sx")
 
 pub type Demangled = {
@@ -15,8 +14,8 @@ pub type Demangled = {
 }
 
 fn strip_prefix(s: ref u8, prefix: ref u8) ref u8 = trust {
-    if string.raw_starts_with(s, prefix) {
-        return @ptradd(s, string.len_raw(prefix))
+    if util.starts_with[_, _](s, prefix) {
+        return @ptradd(s, util.len_raw[_](prefix))
     }
     return s
 }
@@ -24,42 +23,42 @@ fn strip_prefix(s: ref u8, prefix: ref u8) ref u8 = trust {
 /// Turn `sx__` / `t_` compiler-internal names back into source names.
 pub fn source_name(sym: ref u8) ref u8 = trust {
     if sym == none {
-        return ""
+        return c""
     }
     val s: mut ref u8 = sym
-    if string.raw_starts_with(s, "sx__") {
-        s = strip_prefix(s, "sx__")
+    if util.starts_with[_, _](s, "sx__") {
+        s = strip_prefix(s, c"sx__")
     }
-    if string.raw_starts_with(s, "t_") {
-        s = strip_prefix(s, "t_")
+    if util.starts_with[_, _](s, "t_") {
+        s = strip_prefix(s, c"t_")
     }
     return s
 }
 
 fn demangle_type_name(t: ref u8) ref u8 = trust {
     if t == none {
-        return ""
+        return c""
     }
-    if string.raw_starts_with(t, "ref_") {
-        return @fmtalloc("ref {s}", {demangle_type_name(strip_prefix(t, "ref_"))})
+    if util.starts_with[_, _](t, "ref_") {
+        return @fmtalloc(c"ref {s}", {demangle_type_name(strip_prefix(t, c"ref_"))})
     }
-    if string.raw_starts_with(t, "mut_") {
-        return @fmtalloc("mut {s}", {demangle_type_name(strip_prefix(t, "mut_"))})
+    if util.starts_with[_, _](t, "mut_") {
+        return @fmtalloc(c"mut {s}", {demangle_type_name(strip_prefix(t, c"mut_"))})
     }
     return t
 }
 
 fn generic_args(suffix: ref u8) ref u8 = trust {
-    if suffix == none || string.len_raw(suffix) == 0 {
-        return ""
+    if suffix == none || util.len_or_zero(suffix) == 0 {
+        return c""
     }
-    val out: ref u8 = @alloc((string.len_raw(suffix) * 2 + 16) as usize) as ref u8
+    val out: ref u8 = @alloc((util.len_or_zero(suffix) * 2 + 16) as usize) as ref u8
     if out == none {
-        return ""
+        return c""
     }
     val oi: mut i64 = 0
     val start: mut i64 = 0
-    val n: i64 = string.len_raw(suffix)
+    val n: i64 = util.len_or_zero(suffix)
     val i: mut i64 = 0
     for {
         if i > n {
@@ -78,7 +77,7 @@ fn generic_args(suffix: ref u8) ref u8 = trust {
                 }
                 val part: ref u8 = util.copy_cstr_len(@ptradd(suffix, start), i - start)
                 val pretty: ref u8 = demangle_type_name(part)
-                val plen: i64 = string.len_raw(pretty)
+                val plen: i64 = util.len_raw[_](pretty)
                 @memcpy(@ptradd(out, oi), pretty, plen as usize)
                 oi += plen
             }
@@ -106,38 +105,38 @@ pub fn demangle(sym: ref u8) Demangled = trust {
         display: sym,
     }
     if sym == none {
-        d.raw = ""
-        d.name = ""
-        d.display = ""
+        d.raw = c""
+        d.name = c""
+        d.display = c""
         return d
     }
-    if string.len_raw(sym) == 0 || @load8(sym) == 95 || @load8(sym) == 46 {
+    if util.len_raw[_](sym) == 0 || @load8(sym) == 95 || @load8(sym) == 46 {
         return d
     }
     // The compiler's runtime entry point is not user code; label it clearly
     // instead of showing the internal `sx__init` spelling.
-    if string.str_eql(sym, "sx__init") {
-        d.module = ""
-        d.name = "init"
-        d.generic = ""
-        d.display = "[spectre runtime init]"
+    if util.eq[_, _](sym, "sx__init") {
+        d.module = c""
+        d.name = c"init"
+        d.generic = c""
+        d.display = c"[spectre runtime init]"
         return d
     }
 
     val s: mut ref u8 = sym
-    if string.raw_starts_with(s, "sx__") {
-        s = strip_prefix(s, "sx__")
-        if string.raw_starts_with(s, "sx__") {
-            s = strip_prefix(s, "sx__")
+    if util.starts_with[_, _](s, "sx__") {
+        s = strip_prefix(s, c"sx__")
+        if util.starts_with[_, _](s, "sx__") {
+            s = strip_prefix(s, c"sx__")
         }
     }
 
     val base: mut ref u8 = s
-    val gen: mut ref u8 = ""
-    val marker: ref u8 = "__GENMONO"
-    if util.contains(base, marker) {
-        val n: i64 = string.len_raw(base)
-        val m: i64 = string.len_raw(marker)
+    val gen: mut ref u8 = c""
+    val marker: ref u8 = c"__GENMONO"
+    if util.contains[_, _](base, marker) {
+        val n: i64 = util.len_raw[_](base)
+        val m: i64 = util.len_raw[_](marker)
         val pos: mut i64 = -1
         val i: mut i64 = 0
         for {
@@ -164,15 +163,15 @@ pub fn demangle(sym: ref u8) Demangled = trust {
         }
         if pos >= 0 {
             gen = @ptradd(base, pos + m)
-            if string.raw_starts_with(gen, "__") {
-                gen = strip_prefix(gen, "__")
+            if util.starts_with[_, _](gen, "__") {
+                gen = strip_prefix(gen, c"__")
             }
             base = util.copy_cstr_len(base, pos)
         }
     }
 
-    if string.len_raw(base) == 0 {
-        d.module = ""
+    if util.len_raw[_](base) == 0 {
+        d.module = c""
         d.name = base
         d.generic = generic_args(gen)
         d.display = base
@@ -180,7 +179,7 @@ pub fn demangle(sym: ref u8) Demangled = trust {
     }
 
     val last_sep: mut i64 = -1
-    val bn: i64 = string.len_raw(base)
+    val bn: i64 = util.len_raw[_](base)
     val bi: mut i64 = 0
     for {
         if bi + 1 >= bn {
@@ -195,7 +194,7 @@ pub fn demangle(sym: ref u8) Demangled = trust {
     }
 
     if last_sep < 0 {
-        d.module = ""
+        d.module = c""
         d.name = base
     } else {
         d.module = util.copy_cstr_len(base, last_sep)
@@ -204,8 +203,8 @@ pub fn demangle(sym: ref u8) Demangled = trust {
 
     // Convert remaining double underscores in the module prefix to "." for
     // display purposes.
-    if string.len_raw(d.module) > 0 {
-        val slen: i64 = string.len_raw(d.module)
+    if util.len_raw[ref u8](d.module) > 0 {
+        val slen: i64 = util.len_raw[ref u8](d.module)
         val pretty_mod: ref u8 = @alloc((slen + 1) as usize) as ref u8
         val oi: mut i64 = 0
         val si: mut i64 = 0
@@ -229,14 +228,14 @@ pub fn demangle(sym: ref u8) Demangled = trust {
     }
 
     d.generic = generic_args(gen)
-    if string.len_raw(d.module) > 0 {
-        if string.len_raw(d.generic) > 0 {
+    if util.len_raw[ref u8](d.module) > 0 {
+        if util.len_raw[ref u8](d.generic) > 0 {
             d.display = @fmtalloc("{s}.{s}[{s}]", {d.module, d.name, d.generic})
         } else {
             d.display = @fmtalloc("{s}.{s}", {d.module, d.name})
         }
     } else {
-        if string.len_raw(d.generic) > 0 {
+        if util.len_raw[ref u8](d.generic) > 0 {
             d.display = @fmtalloc("{s}[{s}]", {d.name, d.generic})
         } else {
             d.display = d.name
@@ -262,19 +261,19 @@ pub fn matches(sym: ref u8, query: ref u8) bool = trust {
     if sym == none || query == none {
         return false
     }
-    if string.str_eql(sym, query) {
+    if util.eq[_, _](sym, query) {
         return true
     }
     val d: Demangled = demangle(sym)
-    if string.str_eql(d.display, query) || string.str_eql(d.name, query) {
+    if util.eq[ref u8, ref u8](d.display, query) || util.eq[ref u8, ref u8](d.name, query) {
         return true
     }
-    if string.str_eql(source_name(sym), query) {
+    if util.eq[ref u8, ref u8](source_name(sym), query) {
         return true
     }
     // Accept "module::name", "module.name", "module/name" spellings, and
     // both <> and [] for generic arguments.
-    val n: i64 = string.len_raw(query)
+    val n: i64 = util.len_raw[_](query)
     val norm: ref u8 = @alloc((n + 1) as usize) as ref u8
     val oi: mut i64 = 0
     val i: mut i64 = 0
@@ -302,17 +301,17 @@ pub fn matches(sym: ref u8, query: ref u8) bool = trust {
         i++
     }
     @store8(@ptradd(norm, oi), 0)
-    if string.str_eql(d.display, norm) {
+    if util.eq[ref u8, ref u8](d.display, norm) {
         return true
     }
     // Match a trailing component: e.g. "stdio.print" against
     // "std.stdio.print".
     val suffix: mut ref u8 = query
     for {
-        if string.len_raw(suffix) == 0 {
+        if util.len_or_zero(suffix) == 0 {
             break
         }
-        if string.str_eql(d.display, suffix) || string.str_eql(d.name, suffix) {
+        if util.eq[ref u8, ref u8](d.display, suffix) || util.eq[ref u8, ref u8](d.name, suffix) {
             return true
         }
         val c: u8 = @load8(suffix)
@@ -320,7 +319,7 @@ pub fn matches(sym: ref u8, query: ref u8) bool = trust {
             suffix = @ptradd(suffix, 1)
         } else {
             // Advance to the next separator.
-            val sn: i64 = string.len_raw(suffix)
+            val sn: i64 = util.len_or_zero(suffix)
             val si: mut i64 = 0
             for {
                 if si >= sn {
@@ -343,10 +342,10 @@ pub fn matches(sym: ref u8, query: ref u8) bool = trust {
 
 test "demangles modules with dots and generics with brackets" {
     trust {
-        assert string.str_eql(pretty("std__stdio__print"), "std.stdio.print")
-        assert string.str_eql(pretty("sx__sx__identity__GENMONO__i64"), "identity[i64]")
-        assert string.str_eql(
-            pretty("std__fmt__render__GENMONO__i32__ref_u8"),
+        assert util.eq[ref u8, ref u8](pretty(c"std__stdio__print"), c"std.stdio.print")
+        assert util.eq[ref u8, ref u8](pretty(c"sx__sx__identity__GENMONO__i64"), c"identity[i64]")
+        assert util.eq[ref u8, StringView](
+            pretty(c"std__fmt__render__GENMONO__i32__ref_u8"),
             "std.fmt.render[i32, ref u8]"
         )
     }
@@ -354,24 +353,24 @@ test "demangles modules with dots and generics with brackets" {
 
 test "labels the spectre runtime init" {
     trust {
-        assert string.str_eql(pretty("sx__init"), "[spectre runtime init]")
+        assert util.eq[ref u8, ref u8](pretty(c"sx__init"), c"[spectre runtime init]")
     }
 }
 
 test "matches current and legacy symbol spellings" {
     trust {
-        assert matches("std__stdio__print", "std.stdio.print")
-        assert matches("std__stdio__print", "std::stdio::print")
-        assert matches("sx__sx__identity__GENMONO__i64", "identity[i64]")
-        assert matches("sx__sx__identity__GENMONO__i64", "identity<i64>")
-        assert !matches("std__stdio__print", "nope")
+        assert matches(c"std__stdio__print", c"std.stdio.print")
+        assert matches(c"std__stdio__print", c"std::stdio::print")
+        assert matches(c"sx__sx__identity__GENMONO__i64", c"identity[i64]")
+        assert matches(c"sx__sx__identity__GENMONO__i64", c"identity<i64>")
+        assert !matches(c"std__stdio__print", c"nope")
     }
 }
 
 test "strips compiler prefixes from source names" {
     trust {
-        assert string.str_eql(source_name("t_sum"), "sum")
-        assert string.str_eql(source_name("sx__count"), "count")
-        assert string.str_eql(short_name("std__stdio__print"), "print")
+        assert util.eq[ref u8, ref u8](source_name(c"t_sum"), c"sum")
+        assert util.eq[ref u8, ref u8](source_name(c"sx__count"), c"count")
+        assert util.eq[ref u8, ref u8](short_name(c"std__stdio__print"), c"print")
     }
 }

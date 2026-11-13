@@ -4,7 +4,6 @@
 /// SPDX-License-Identifier: GPL-3.0-only
 
 val stdio      = use("std/stdio")
-val string     = use("std/string")
 val fs         = use("std/fs")
 val allocators = use("std/allocators")
 val util       = use("util.sx")
@@ -19,21 +18,21 @@ fn read_command() ref u8 = trust {
     val buf: mut [8192]u8 = @zeroed
     val p: ref u8 = fgets(@addr(buf) as ref u8, 8192, @stdin())
     if p == none {
-        return ""
+        return c""
     }
     val out: ref u8 = @addr(buf) as ref u8
-    val n: i64 = string.len_raw(out)
+    val n: i64 = util.len_raw[_](out)
     if n > 0 && @load8(@ptradd(out, n - 1)) == 10 {
         @store8(@ptradd(out, n - 1), 0)
     }
     if n > 1 && @load8(@ptradd(out, n - 2)) == 13 {
         @store8(@ptradd(out, n - 2), 0)
     }
-    return util.copy_cstr(out)
+    return util.copy_cstr[_](out)
 }
 
 fn split_word(line: ref u8, out_rest: mut ref u8) ref u8 = trust {
-    val n: i64 = string.len_raw(line)
+    val n: i64 = util.len_raw[_](line)
     val i: mut i64 = 0
     for {
         if i >= n {
@@ -47,7 +46,7 @@ fn split_word(line: ref u8, out_rest: mut ref u8) ref u8 = trust {
     }
     @store(out_rest, @ptradd(line, i))
     val rest: ref u8 = @load(out_rest)
-    val rn: i64 = string.len_raw(rest)
+    val rn: i64 = util.len_raw[_](rest)
     val rs: mut i64 = 0
     for {
         if rs >= rn {
@@ -91,9 +90,9 @@ type SourceVarInfo = {
 
 fn source_trim(s: ref u8) ref u8 = trust {
     if s == none {
-        return ""
+        return c""
     }
-    val n: i64 = string.len_raw(s)
+    val n: i64 = util.len_raw[_](s)
     val start: mut i64 = 0
     for {
         if start >= n {
@@ -127,8 +126,8 @@ fn source_is_ident(c: u8) bool = trust {
 }
 
 fn source_match_at(s: ref u8, pos: i64, needle: ref u8) bool = trust {
-    val n: i64 = string.len_raw(s)
-    val m: i64 = string.len_raw(needle)
+    val n: i64 = util.len_raw[_](s)
+    val m: i64 = util.len_raw[_](needle)
     if pos < 0 || pos + m > n {
         return false
     }
@@ -146,7 +145,7 @@ fn source_match_at(s: ref u8, pos: i64, needle: ref u8) bool = trust {
 }
 
 fn source_skip_ws(s: ref u8, pos_in: i64) i64 = trust {
-    val n: i64 = string.len_raw(s)
+    val n: i64 = util.len_raw[_](s)
     val p: mut i64 = pos_in
     for {
         if p >= n {
@@ -163,7 +162,7 @@ fn source_skip_ws(s: ref u8, pos_in: i64) i64 = trust {
 }
 
 fn source_count_elements(s: ref u8, start: i64) i64 = trust {
-    val n: i64 = string.len_raw(s)
+    val n: i64 = util.len_raw[_](s)
     val depth: mut i64 = 1
     val count: mut i64 = 0
     val has_item: mut bool = false
@@ -244,18 +243,18 @@ fn source_count_elements(s: ref u8, start: i64) i64 = trust {
 fn source_var_info(file: ref u8, name: ref u8) SourceVarInfo = trust {
     val info: mut SourceVarInfo = {type_text: "", array_count: -1}
     if file == none || name == none ||
-    string.len_raw(file) == 0 || string.len_raw(name) == 0 {
+    util.len_or_zero(file) == 0 || util.len_or_zero(name) == 0 {
         return info
     }
-    val data_opt = fs.read_all_raw(file)
+    val data_opt = fs.read_all_heap_cstr(file)
     val data: mut ref u8 = none
     if data_opt is some dv {
         data = dv as ref u8
     } else {
         return info
     }
-    val n: i64 = string.len_raw(data)
-    val name_len: i64 = string.len_raw(name)
+    val n: i64 = util.len_raw[_](data)
+    val name_len: i64 = util.len_or_zero(name)
     val i: mut i64 = 0
     for {
         if i + name_len > n {
@@ -268,7 +267,7 @@ fn source_var_info(file: ref u8, name: ref u8) SourceVarInfo = trust {
             if before_ok && after_ok {
                 val p0: i64 = source_skip_ws(data, after_i)
                 val p: mut i64 = p0
-                val type_text: mut ref u8 = ""
+                val type_text: mut ref u8 = c""
                 if p < n && @load8(@ptradd(data, p)) == 58 {
                     val ts: i64 = source_skip_ws(data, p + 1)
                     val te: mut i64 = ts
@@ -302,7 +301,7 @@ fn source_var_info(file: ref u8, name: ref u8) SourceVarInfo = trust {
 
 fn find_dwarf_var(t: ref target.Target, raw_name: ref u8) ref dwarf.DwarfVariable = trust {
     for v in t.dwarf_info.variables {
-        if string.str_eql(v.name, raw_name) {
+        if util.eq[ref u8, ref u8](v.name, raw_name) {
             return v
         }
     }
@@ -310,25 +309,25 @@ fn find_dwarf_var(t: ref target.Target, raw_name: ref u8) ref dwarf.DwarfVariabl
 }
 
 fn array_element_type(type_text: ref u8) ref u8 = trust {
-    if string.len_raw(type_text) == 0 || @load8(type_text) != 91 {
-        return ""
+    if util.len_raw[_](type_text) == 0 || @load8(type_text) != 91 {
+        return c""
     }
     val rb: i64 = find_char(type_text, 0, 93)
     if rb < 0 {
-        return ""
+        return c""
     }
     return source_trim(@ptradd(type_text, rb + 1))
 }
 
 fn value_u64(value: ref u8) option[u64] = trust {
     val v: ref u8 = source_trim(value)
-    if string.len_raw(v) == 0 {
+    if util.len_raw[_](v) == 0 {
         return none
     }
-    if string.raw_starts_with(v, "0x") || string.raw_starts_with(v, "0X") {
-        return util.parse_u64_hex(v)
+    if util.starts_with[_, _](v, "0x") || util.starts_with[_, _](v, "0X") {
+        return util.parse_u64_hex[_](v)
     }
-    val iv_opt = util.parse_i64(v)
+    val iv_opt = util.parse_i64[_](v)
     if iv_opt is some iv {
         if iv < 0 {
             return none
@@ -373,35 +372,35 @@ fn print_locals_lldb(s: mut ref lldb.LldbSession, t: ref target.Target) void = t
         return
     }
     for v in vars {
-        val spectre: mut ref u8 = ""
+        val spectre: mut ref u8 = c""
         val array_count: mut i64 = -1
         val dv: ref dwarf.DwarfVariable = find_dwarf_var(t, v.raw_name)
         if dv != none {
             val info: SourceVarInfo = source_var_info(dv.file, v.name)
-            if string.len_raw(info.type_text) > 0 {
+            if util.len_raw[ref u8](info.type_text) > 0 {
                 spectre = info.type_text
             }
             array_count = info.array_count
         }
-        if string.len_raw(spectre) == 0 {
+        if util.len_raw[_](spectre) == 0 {
             spectre = lldb.spectre_type(v.type_name)
         }
         val value: mut ref u8 = v.value
         if array_count >= 0 && value_is_readable_pointer(t, v.value) {
             val elem_type: ref u8 = array_element_type(spectre)
-            if string.len_raw(elem_type) > 0 {
+            if util.len_raw[_](elem_type) > 0 {
                 val elem_c: ref u8 = lldb.spectre_to_c_type(elem_type)
-                if string.len_raw(elem_c) > 0 {
+                if util.len_raw[_](elem_c) > 0 {
                     val array_value: ref u8 = lldb.read_array(
                         s, v.raw_name, elem_c, array_count
                     )
-                    if string.len_raw(array_value) > 0 {
+                    if util.len_raw[_](array_value) > 0 {
                         value = array_value
                     }
                 }
             }
         }
-        if string.len_raw(spectre) > 0 {
+        if util.len_raw[_](spectre) > 0 {
             stdio.print("  ({s} / {s}) {s} = {s}\n", {
                 v.type_name, spectre, v.name, value
             })
@@ -422,7 +421,7 @@ fn print_watch_lldb(s: mut ref lldb.LldbSession, watches: list[ref u8]) void = t
 fn print_watch_native(s: ref native.NativeSession, watches: list[ref u8]) void = trust {
     for w in watches {
         val out: ref u8 = native.read_expression(s, w)
-        if string.len_raw(out) == 0 {
+        if util.len_raw[_](out) == 0 {
             stdio.print("watch {s} = <unavailable>\n", {w})
         } else {
             stdio.print("watch {s} = {s}\n", {w, out})
@@ -432,7 +431,7 @@ fn print_watch_native(s: ref native.NativeSession, watches: list[ref u8]) void =
 
 fn trim_expr_result(out: ref u8) ref u8 = trust {
     // LLDB expression output is usually "(type) value". Keep the last line.
-    val n: i64 = string.len_raw(out)
+    val n: i64 = util.len_raw[_](out)
     val start: mut i64 = n
     for {
         if start <= 0 {
@@ -451,7 +450,7 @@ fn trim_expr_result(out: ref u8) ref u8 = trust {
     val rp: i64 = find_char(line, 0, 41)
     if rp >= 0 {
         val vs: mut i64 = rp + 1
-        val ln: i64 = string.len_raw(line)
+        val ln: i64 = util.len_raw[_](line)
         for {
             if vs >= ln {
                 break
@@ -464,14 +463,14 @@ fn trim_expr_result(out: ref u8) ref u8 = trust {
         }
         return util.copy_cstr_len(@ptradd(line, vs), ln - vs)
     }
-    if string.len_raw(line) == 0 {
-        return "<unavailable>"
+    if util.len_raw[_](line) == 0 {
+        return c"<unavailable>"
     }
     return line
 }
 
 fn skip_first_word(rest: ref u8) ref u8 = trust {
-    val tail: mut ref u8 = ""
+    val tail: mut ref u8 = c""
     split_word(rest, @addr(tail))
     return tail
 }
@@ -493,7 +492,7 @@ fn format_code_addr(t: ref target.Target, addr: u64) ref u8 = trust {
 /// Print a gdb-style `info line` result from the loaded ELF/DWARF metadata.
 fn info_line_target(t: ref target.Target, query: ref u8) bool = trust {
     val q: ref u8 = source_trim(query)
-    if string.len_raw(q) == 0 {
+    if util.len_raw[_](q) == 0 {
         stdio.puts("usage: info line <file:line|function>")
         return true
     }
@@ -501,7 +500,7 @@ fn info_line_target(t: ref target.Target, query: ref u8) bool = trust {
         val addr_opt = value_u64(@ptradd(q, 1))
         if addr_opt is some addr {
             val row: ref dwarf.DwarfLineRow = dwarf.line_for_pc(t.dwarf_info, addr)
-            if row != none && string.len_raw(row.file) > 0 {
+            if row != none && util.len_or_zero(row.file) > 0 {
                 stdio.print("Line {lld} of \"{s}\" is at address {s}.\n", {
                     row.line, row.file, format_code_addr(t, addr)
                 })
@@ -515,7 +514,7 @@ fn info_line_target(t: ref target.Target, query: ref u8) bool = trust {
     }
     val colon: i64 = last_colon(q)
     if colon > 0 {
-        val line_opt = util.parse_i64(@ptradd(q, colon + 1))
+        val line_opt = util.parse_i64[ref u8](@ptradd(q, colon + 1))
         if line_opt is some line {
             val file: ref u8 = util.copy_cstr_len(q, colon)
             val addr_opt = target.line_address(t, file, line)
@@ -544,7 +543,7 @@ fn info_line_target(t: ref target.Target, query: ref u8) bool = trust {
     val addr_opt = target.function_address(t, q)
     if addr_opt is some addr {
         val row: ref dwarf.DwarfLineRow = dwarf.line_for_pc(t.dwarf_info, addr)
-        if row != none && string.len_raw(row.file) > 0 {
+        if row != none && util.len_or_zero(row.file) > 0 {
             stdio.print("Line {lld} of \"{s}\" starts at address {s}.\n", {
                 row.line, row.file, format_code_addr(t, addr)
             })
@@ -560,7 +559,7 @@ fn info_line_target(t: ref target.Target, query: ref u8) bool = trust {
 
 fn info_line_lldb(s: mut ref lldb.LldbSession, t: ref target.Target, query: ref u8) void = trust {
     val q: ref u8 = source_trim(query)
-    if string.len_raw(q) == 0 {
+    if util.len_raw[_](q) == 0 {
         stdio.puts("usage: info line <file:line|function>")
         return
     }
@@ -571,7 +570,7 @@ fn info_line_lldb(s: mut ref lldb.LldbSession, t: ref target.Target, query: ref 
     }
     val colon: i64 = last_colon(q)
     if colon > 0 {
-        val line_opt = util.parse_i64(@ptradd(q, colon + 1))
+        val line_opt = util.parse_i64[ref u8](@ptradd(q, colon + 1))
         if line_opt is some line {
             val file: ref u8 = util.copy_cstr_len(q, colon)
             val out: ref u8 = lldb.clean_output(lldb.command(
@@ -590,7 +589,7 @@ fn info_line_lldb(s: mut ref lldb.LldbSession, t: ref target.Target, query: ref 
 }
 
 fn find_char(s: ref u8, start: i64, ch: u8) i64 = trust {
-    val n: i64 = string.len_raw(s)
+    val n: i64 = util.len_raw[_](s)
     val i: mut i64 = start
     for {
         if i >= n {
@@ -624,9 +623,9 @@ fn print_lldb_stop(s: mut ref lldb.LldbSession) void = trust {
     if f == none {
         return
     }
-    if string.len_raw(f.file) > 0 {
+    if util.len_raw[ref u8](f.file) > 0 {
         stdio.print("Stopped in {s} at {s}:{lld}\n", {
-            f.function_display, util.basename(f.file), f.line
+            f.function_display, util.basename[ref u8](f.file), f.line
         })
         print_source_at(f.file, f.line)
     } else {
@@ -640,11 +639,11 @@ fn print_native_stop(s: ref native.NativeSession) void = trust {
         return
     }
     val loc: ref u8 = native.current_location(s)
-    if string.len_raw(loc) > 0 {
-        stdio.print("Stopped in {s} at {s}\n", {native.current_function_name(s), util.basename(loc)})
+    if util.len_raw[_](loc) > 0 {
+        stdio.print("Stopped in {s} at {s}\n", {native.current_function_name(s), util.basename[_](loc)})
         val colon: i64 = last_colon(loc)
         if colon > 0 {
-            val line_opt = util.parse_i64(@ptradd(loc, colon + 1))
+            val line_opt = util.parse_i64[ref u8](@ptradd(loc, colon + 1))
             if line_opt is some line {
                 print_source_at(util.copy_cstr_len(loc, colon), line)
             }
@@ -655,7 +654,7 @@ fn print_native_stop(s: ref native.NativeSession) void = trust {
 }
 
 fn last_colon(s: ref u8) i64 = trust {
-    val n: i64 = string.len_raw(s)
+    val n: i64 = util.len_raw[_](s)
     val i: mut i64 = n - 1
     for {
         if i < 0 {
@@ -670,14 +669,14 @@ fn last_colon(s: ref u8) i64 = trust {
 }
 
 fn print_source_at(file: ref u8, line: i64) void = trust {
-    val data_opt = fs.read_all_raw(file)
+    val data_opt = fs.read_all_heap_cstr(file)
     val data: mut ref u8 = none
     if data_opt is some dv {
         data = dv as ref u8
     } else {
         return
     }
-    val n: i64 = string.len_raw(data)
+    val n: i64 = util.len_raw[_](data)
     val cur: mut i64 = 1
     val pos: mut i64 = 0
     for {
@@ -692,9 +691,9 @@ fn print_source_at(file: ref u8, line: i64) void = trust {
             end++
         }
         if cur >= line - 2 && cur <= line + 2 {
-            val marker: mut ref u8 = "  "
+            val marker: mut ref u8 = c"  "
             if cur == line {
-                marker = "> "
+                marker = c"> "
             }
             stdio.print("{s}{lld}: {s}\n", {marker, cur, util.copy_cstr_len(@ptradd(data, pos), end - pos)})
         }
@@ -713,7 +712,7 @@ fn set_lldb_breakpoint(
 ) void = trust {
     val colon: i64 = last_colon(query)
     if colon > 0 {
-        val line_opt = util.parse_i64(@ptradd(query, colon + 1))
+        val line_opt = util.parse_i64[ref u8](@ptradd(query, colon + 1))
         if line_opt is some line {
             val file: ref u8 = util.copy_cstr_len(query, colon)
             val out: ref u8 = lldb.clean_output(lldb.breakpoint_file_line(s, file, line))
@@ -723,7 +722,7 @@ fn set_lldb_breakpoint(
     }
     val raw: ref u8 = target.function_raw(t, query)
     val name: mut ref u8 = raw
-    if string.len_raw(name) == 0 {
+    if util.len_or_zero(name) == 0 {
         name = query
     }
     val out2: ref u8 = lldb.clean_output(lldb.breakpoint_symbol(s, name))
@@ -738,12 +737,12 @@ fn exec_lldb_command(
     watches: mut list[ref u8],
     startup_args: list[ref u8]
 ) bool = trust {
-    if string.str_eql(cmd, "quit") || string.str_eql(cmd, "q") || string.str_eql(cmd, "exit") {
+    if util.eq[_, _](cmd, "quit") || util.eq[_, _](cmd, "q") || util.eq[_, _](cmd, "exit") {
         lldb.quit(s)
         return true
-    } elif string.str_eql(cmd, "help") || string.str_eql(cmd, "h") {
+    } elif util.eq[_, _](cmd, "help") || util.eq[_, _](cmd, "h") {
         print_help()
-    } elif string.str_eql(cmd, "run") || string.str_eql(cmd, "r") {
+    } elif util.eq[_, _](cmd, "run") || util.eq[_, _](cmd, "r") {
         val args: list[ref u8] = split_args(rest)
         val final_args: mut list[ref u8] = args
         if @len(args) == 0 {
@@ -752,64 +751,64 @@ fn exec_lldb_command(
         lldb.run(s, final_args)
         print_lldb_stop(s)
         print_watch_lldb(s, watches)
-    } elif string.str_eql(cmd, "continue") || string.str_eql(cmd, "c") {
+    } elif util.eq[_, _](cmd, "continue") || util.eq[_, _](cmd, "c") {
         lldb.cont(s)
         print_lldb_stop(s)
         print_watch_lldb(s, watches)
-    } elif string.str_eql(cmd, "next") || string.str_eql(cmd, "n") {
+    } elif util.eq[_, _](cmd, "next") || util.eq[_, _](cmd, "n") {
         lldb.next(s)
         print_lldb_stop(s)
         print_watch_lldb(s, watches)
-    } elif string.str_eql(cmd, "step") || string.str_eql(cmd, "s") {
+    } elif util.eq[_, _](cmd, "step") || util.eq[_, _](cmd, "s") {
         lldb.step(s)
         print_lldb_stop(s)
         print_watch_lldb(s, watches)
-    } elif string.str_eql(cmd, "finish") || string.str_eql(cmd, "f") {
+    } elif util.eq[_, _](cmd, "finish") || util.eq[_, _](cmd, "f") {
         lldb.finish(s)
         print_lldb_stop(s)
         print_watch_lldb(s, watches)
-    } elif string.str_eql(cmd, "break") || string.str_eql(cmd, "b") {
-        if string.len_raw(rest) > 0 {
+    } elif util.eq[_, _](cmd, "break") || util.eq[_, _](cmd, "b") {
+        if util.len_raw[_](rest) > 0 {
             set_lldb_breakpoint(s, t, rest)
         }
-    } elif string.str_eql(cmd, "info") {
-        if string.raw_starts_with(rest, "break") || string.raw_starts_with(rest, "b") {
+    } elif util.eq[_, _](cmd, "info") {
+        if util.starts_with[_, _](rest, "break") || util.starts_with[_, _](rest, "b") {
             stdio.print("{s}\n", {lldb.clean_output(lldb.list_breakpoints(s))})
-        } elif string.raw_starts_with(rest, "line") {
+        } elif util.starts_with[_, _](rest, "line") {
             info_line_lldb(s, t, skip_first_word(rest))
         } else {
             stdio.puts("usage: info break | info line <file:line|func>")
         }
-    } elif string.str_eql(cmd, "delete") || string.str_eql(cmd, "d") {
-        val id_opt = util.parse_i64(rest)
+    } elif util.eq[_, _](cmd, "delete") || util.eq[_, _](cmd, "d") {
+        val id_opt = util.parse_i64[_](rest)
         if id_opt is some id {
             stdio.print("{s}\n", {lldb.clean_output(lldb.delete_breakpoint(s, id))})
         } else {
             stdio.puts("usage: delete <id>")
         }
-    } elif string.str_eql(cmd, "locals") || string.str_eql(cmd, "vars") || string.str_eql(cmd, "l") {
+    } elif util.eq[_, _](cmd, "locals") || util.eq[_, _](cmd, "vars") || util.eq[_, _](cmd, "l") {
         print_locals_lldb(s, t)
-    } elif string.str_eql(cmd, "print") || string.str_eql(cmd, "p") {
+    } elif util.eq[_, _](cmd, "print") || util.eq[_, _](cmd, "p") {
         val expr: ref u8 = lldb.rewrite_expression(s, rest)
         val out: ref u8 = lldb.clean_output(lldb.expression(s, expr))
         stdio.print("{s}\n", {out})
-    } elif string.str_eql(cmd, "watch") {
-        if string.len_raw(rest) > 0 {
-            @append(watches, util.copy_cstr(rest))
+    } elif util.eq[_, _](cmd, "watch") {
+        if util.len_raw[_](rest) > 0 {
+            @append(watches, util.copy_cstr[_](rest))
             print_watch_lldb(s, watches)
         }
-    } elif string.str_eql(cmd, "unwatch") {
-        val idx_opt = util.parse_i64(rest)
+    } elif util.eq[_, _](cmd, "unwatch") {
+        val idx_opt = util.parse_i64[_](rest)
         if idx_opt is some idx {
             val ii: i64 = idx
             if ii > 0 && ii <= (@len(watches) as i64) {
                 @remove(watches, (ii - 1) as usize)
             }
         }
-    } elif string.str_eql(cmd, "backtrace") || string.str_eql(cmd, "bt") {
+    } elif util.eq[_, _](cmd, "backtrace") || util.eq[_, _](cmd, "bt") {
         stdio.print("{s}\n", {lldb.clean_output(lldb.backtrace(s, 32))})
-    } elif string.str_eql(cmd, "list") {
-        val line_opt = util.parse_i64(rest)
+    } elif util.eq[_, _](cmd, "list") {
+        val line_opt = util.parse_i64[_](rest)
         if line_opt is some line {
             stdio.print("{s}\n", {lldb.clean_output(lldb.source_line(s, line))})
         } else {
@@ -828,7 +827,7 @@ fn run_lldb(
     batch: bool,
     commands: list[ref u8]
 ) i32 = trust {
-    val s_opt = lldb.new("lldb", program)
+    val s_opt = lldb.new(c"lldb", program)
     val s: mut ref lldb.LldbSession = none
     match s_opt {
         err e => {
@@ -843,10 +842,10 @@ fn run_lldb(
     if batch {
         if (@len(commands) as i64) > 0 {
             for line in commands {
-                if string.len_raw(line) == 0 {
+                if util.len_raw[ref u8](line) == 0 {
                     continue
                 }
-                val rest: mut ref u8 = ""
+                val rest: mut ref u8 = c""
                 val cmd: ref u8 = split_word(line, @addr(rest))
                 if exec_lldb_command(s, t, cmd, rest, watches, startup_args) {
                     break
@@ -855,10 +854,10 @@ fn run_lldb(
         } else {
             for {
                 val line: ref u8 = read_command()
-                if string.len_raw(line) == 0 {
+                if util.len_raw[_](line) == 0 {
                     break
                 }
-                val rest: mut ref u8 = ""
+                val rest: mut ref u8 = c""
                 val cmd: ref u8 = split_word(line, @addr(rest))
                 if exec_lldb_command(s, t, cmd, rest, watches, startup_args) {
                     break
@@ -873,13 +872,13 @@ fn run_lldb(
     for {
         stdio.print("(phantom) ", {})
         val line: ref u8 = read_command()
-        if string.len_raw(line) == 0 {
+        if util.len_raw[_](line) == 0 {
             if s.exited {
                 break
             }
             continue
         }
-        val rest: mut ref u8 = ""
+        val rest: mut ref u8 = c""
         val cmd: ref u8 = split_word(line, @addr(rest))
         if exec_lldb_command(s, t, cmd, rest, watches, startup_args) {
             break
@@ -890,7 +889,7 @@ fn run_lldb(
 
 fn split_args(rest: ref u8) list[ref u8] = trust {
     val out: mut list[ref u8] = @listalloc[allocators.HeapAllocator, ref u8](util.heap())?
-    val n: i64 = string.len_raw(rest)
+    val n: i64 = util.len_raw[_](rest)
     val i: mut i64 = 0
     for {
         if i >= n {
@@ -925,12 +924,12 @@ fn exec_native_command(
     watches: mut list[ref u8],
     startup_args: list[ref u8]
 ) bool = trust {
-    if string.str_eql(cmd, "quit") || string.str_eql(cmd, "q") || string.str_eql(cmd, "exit") {
+    if util.eq[_, _](cmd, "quit") || util.eq[_, _](cmd, "q") || util.eq[_, _](cmd, "exit") {
         native.quit(s)
         return true
-    } elif string.str_eql(cmd, "help") || string.str_eql(cmd, "h") {
+    } elif util.eq[_, _](cmd, "help") || util.eq[_, _](cmd, "h") {
         print_help()
-    } elif string.str_eql(cmd, "run") || string.str_eql(cmd, "r") {
+    } elif util.eq[_, _](cmd, "run") || util.eq[_, _](cmd, "r") {
         if s.started && !s.exited {
             native.cont(s)
         } else {
@@ -952,7 +951,7 @@ fn exec_native_command(
         }
         print_native_stop(s)
         print_watch_native(s, watches)
-    } elif string.str_eql(cmd, "continue") || string.str_eql(cmd, "c") {
+    } elif util.eq[_, _](cmd, "continue") || util.eq[_, _](cmd, "c") {
         val cr = native.cont(s)
         match cr {
             err e => {
@@ -964,32 +963,32 @@ fn exec_native_command(
                 print_watch_native(s, watches)
             }
         }
-    } elif string.str_eql(cmd, "next") || string.str_eql(cmd, "n") ||
-    string.str_eql(cmd, "step") || string.str_eql(cmd, "s") ||
-    string.str_eql(cmd, "finish") || string.str_eql(cmd, "f") {
+    } elif util.eq[_, _](cmd, "next") || util.eq[_, _](cmd, "n") ||
+    util.eq[_, _](cmd, "step") || util.eq[_, _](cmd, "s") ||
+    util.eq[_, _](cmd, "finish") || util.eq[_, _](cmd, "f") {
         stdio.puts("phantom: source-level stepping is not implemented in the native backend yet; use the LLDB backend for now.")
-    } elif string.str_eql(cmd, "break") || string.str_eql(cmd, "b") {
-        if string.len_raw(rest) > 0 {
+    } elif util.eq[_, _](cmd, "break") || util.eq[_, _](cmd, "b") {
+        if util.len_raw[_](rest) > 0 {
             val addr_opt = native.resolve_breakpoint(s, rest)
             if addr_opt is some addr {
-                val id: i64 = native.add_breakpoint(s, addr, rest, "source")
+                val id: i64 = native.add_breakpoint(s, addr, rest, c"source")
                 stdio.print("Breakpoint {lld}: {s} at 0x{x}\n", {id, rest, addr})
             } else {
                 stdio.print("phantom: no breakpoint location matching '{s}'\n", {rest})
             }
         }
-    } elif string.str_eql(cmd, "info") {
-        if string.raw_starts_with(rest, "break") || string.raw_starts_with(rest, "b") {
+    } elif util.eq[_, _](cmd, "info") {
+        if util.starts_with[_, _](rest, "break") || util.starts_with[_, _](rest, "b") {
             stdio.print("{s}", {native.list_breakpoints(s)})
-        } elif string.raw_starts_with(rest, "line") {
+        } elif util.starts_with[_, _](rest, "line") {
             if !info_line_target(t, skip_first_word(rest)) {
                 stdio.puts("No line information available.")
             }
         } else {
             stdio.puts("usage: info break | info line <file:line|func>")
         }
-    } elif string.str_eql(cmd, "delete") || string.str_eql(cmd, "d") {
-        val id_opt = util.parse_i64(rest)
+    } elif util.eq[_, _](cmd, "delete") || util.eq[_, _](cmd, "d") {
+        val id_opt = util.parse_i64[_](rest)
         if id_opt is some id {
             if native.delete_breakpoint(s, id) {
                 stdio.print("Deleted breakpoint {lld}\n", {id})
@@ -999,35 +998,35 @@ fn exec_native_command(
         } else {
             stdio.puts("usage: delete <id>")
         }
-    } elif string.str_eql(cmd, "locals") || string.str_eql(cmd, "vars") || string.str_eql(cmd, "l") {
+    } elif util.eq[_, _](cmd, "locals") || util.eq[_, _](cmd, "vars") || util.eq[_, _](cmd, "l") {
         stdio.print("{s}", {native.locals(s)})
-    } elif string.str_eql(cmd, "print") || string.str_eql(cmd, "p") {
+    } elif util.eq[_, _](cmd, "print") || util.eq[_, _](cmd, "p") {
         val out: ref u8 = native.read_expression(s, rest)
-        if string.len_raw(out) == 0 {
+        if util.len_raw[_](out) == 0 {
             stdio.puts("phantom: cannot evaluate expression")
         } else {
             stdio.print("{s}\n", {out})
         }
-    } elif string.str_eql(cmd, "watch") {
-        if string.len_raw(rest) > 0 {
-            @append(watches, util.copy_cstr(rest))
+    } elif util.eq[_, _](cmd, "watch") {
+        if util.len_raw[_](rest) > 0 {
+            @append(watches, util.copy_cstr[_](rest))
             print_watch_native(s, watches)
         }
-    } elif string.str_eql(cmd, "unwatch") {
-        val idx_opt = util.parse_i64(rest)
+    } elif util.eq[_, _](cmd, "unwatch") {
+        val idx_opt = util.parse_i64[_](rest)
         if idx_opt is some idx {
             val ii: i64 = idx
             if ii > 0 && ii <= (@len(watches) as i64) {
                 @remove(watches, (ii - 1) as usize)
             }
         }
-    } elif string.str_eql(cmd, "backtrace") || string.str_eql(cmd, "bt") {
+    } elif util.eq[_, _](cmd, "backtrace") || util.eq[_, _](cmd, "bt") {
         stdio.print("{s}", {native.backtrace(s)})
-    } elif string.str_eql(cmd, "list") {
+    } elif util.eq[_, _](cmd, "list") {
         val loc: ref u8 = native.current_location(s)
         val colon: i64 = last_colon(loc)
         if colon > 0 {
-            val line_opt = util.parse_i64(@ptradd(loc, colon + 1))
+            val line_opt = util.parse_i64[ref u8](@ptradd(loc, colon + 1))
             if line_opt is some line {
                 print_source_at(util.copy_cstr_len(loc, colon), line)
             }
@@ -1061,10 +1060,10 @@ fn run_native(
     if batch {
         if (@len(commands) as i64) > 0 {
             for line in commands {
-                if string.len_raw(line) == 0 {
+                if util.len_raw[ref u8](line) == 0 {
                     continue
                 }
-                val rest: mut ref u8 = ""
+                val rest: mut ref u8 = c""
                 val cmd: ref u8 = split_word(line, @addr(rest))
                 if exec_native_command(s, t, cmd, rest, watches, startup_args) {
                     break
@@ -1073,10 +1072,10 @@ fn run_native(
         } else {
             for {
                 val line: ref u8 = read_command()
-                if string.len_raw(line) == 0 {
+                if util.len_raw[_](line) == 0 {
                     break
                 }
-                val rest: mut ref u8 = ""
+                val rest: mut ref u8 = c""
                 val cmd: ref u8 = split_word(line, @addr(rest))
                 if exec_native_command(s, t, cmd, rest, watches, startup_args) {
                     break
@@ -1091,13 +1090,13 @@ fn run_native(
     for {
         stdio.print("(phantom) ", {})
         val line: ref u8 = read_command()
-        if string.len_raw(line) == 0 {
+        if util.len_raw[_](line) == 0 {
             if s.exited {
                 break
             }
             continue
         }
-        val rest: mut ref u8 = ""
+        val rest: mut ref u8 = c""
         val cmd: ref u8 = split_word(line, @addr(rest))
         if exec_native_command(s, t, cmd, rest, watches, startup_args) {
             break
@@ -1115,8 +1114,8 @@ pub fn run(
     batch: bool,
     commands: list[ref u8]
 ) i32 = trust {
-    if string.str_eql(backend, "native") || string.str_eql(backend, "dwarf") ||
-    string.str_eql(backend, "ptrace") {
+    if util.eq[_, _](backend, "native") || util.eq[_, _](backend, "dwarf") ||
+    util.eq[_, _](backend, "ptrace") {
         return run_native(t, program, args, batch, commands)
     }
     return run_lldb(t, program, args, batch, commands)
@@ -1124,30 +1123,30 @@ pub fn run(
 
 test "counts fixed array literal elements" {
     trust {
-        assert source_count_elements("[\"a\", \"b\", [1, 2], \"c\"]", 1) == 4
-        assert source_count_elements("[1, 2, 3]", 1) == 3
-        assert source_count_elements("[]", 1) == 0
+        assert source_count_elements(c"[\"a\", \"b\", [1, 2], \"c\"]", 1) == 4
+        assert source_count_elements(c"[1, 2, 3]", 1) == 3
+        assert source_count_elements(c"[]", 1) == 0
     }
 }
 
 test "extracts array element types" {
     trust {
-        assert string.str_eql(array_element_type("[_]ref u8"), "ref u8")
-        assert string.str_eql(array_element_type("i64"), "")
+        assert util.eq[ref u8, ref u8](array_element_type(c"[_]ref u8"), c"ref u8")
+        assert util.eq[ref u8, ref u8](array_element_type(c"i64"), c"")
     }
 }
 
 test "reads source variable types and array lengths" {
     trust {
-        val dir: ref u8 = fs.temp_dir_raw()
+        val dir: ref u8 = fs.temp_dir_cstr()
         val path: ref u8 = @fmtalloc("{s}/phantom-source-test.sx", {dir})
-        assert fs.write_all(
+        assert fs.write_all_cstr(
             path,
-            "val xs: [_]ref u8 = [\n    \"a\", \"b\", [1, 2], \"c\"\n]\n"
+            c"val xs: [_]ref u8 = [\n    \"a\", \"b\", [1, 2], \"c\"\n]\n"
         )
-        val info: SourceVarInfo = source_var_info(path, "xs")
-        assert string.str_eql(info.type_text, "[_]ref u8")
+        val info: SourceVarInfo = source_var_info(path, c"xs")
+        assert util.eq[ref u8, StringView](info.type_text, "[_]ref u8")
         assert info.array_count == 4
-        fs.delete(path)
+        fs.delete_cstr(path)
     }
 }
