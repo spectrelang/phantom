@@ -974,7 +974,7 @@ fn parse_line_table(info: mut ref DwarfInfo, cu: ref DwarfCu) void = trust {
             @memset(row, 0, @sizeof(DwarfLineRow) as usize)
             row.address = address
             row.file_index = file
-            row.file = line_file(files, file)
+            row.file = line_file(files, file, version)
             row.line = line
             row.column = column
             row.is_stmt = is_stmt
@@ -998,7 +998,7 @@ fn parse_line_table(info: mut ref DwarfInfo, cu: ref DwarfCu) void = trust {
                 @memset(row, 0, @sizeof(DwarfLineRow) as usize)
                 row.address = address
                 row.file_index = file
-                row.file = line_file(files, file)
+                row.file = line_file(files, file, version)
                 row.line = line
                 row.column = 0
                 row.is_stmt = false
@@ -1020,7 +1020,7 @@ fn parse_line_table(info: mut ref DwarfInfo, cu: ref DwarfCu) void = trust {
             @memset(row, 0, @sizeof(DwarfLineRow) as usize)
             row.address = address
             row.file_index = file
-            row.file = line_file(files, file)
+            row.file = line_file(files, file, version)
             row.line = line
             row.column = column
             row.is_stmt = is_stmt
@@ -1074,36 +1074,42 @@ fn parse_line_table(info: mut ref DwarfInfo, cu: ref DwarfCu) void = trust {
     }
 }
 
-fn line_file(files: list[ref u8], index: u64) ref u8 = trust {
-    if index < (@len(files) as u64) {
+fn line_file(files: list[ref u8], index: u64, version: u16) ref u8 = trust {
+    val n: u64 = @len(files) as u64
+    // DWARF 5 file indices are 0-based. DWARF 4 indices start at 1.
+    if version >= 5 {
+        if index < n {
+            val opt = @get(files, index as usize)
+            if opt is some v {
+                return v as ref u8
+            }
+        }
+    } else {
+        if index == 0 && n > 0 {
+            val first = @get(files, 0)
+            if first is some v {
+                return v as ref u8
+            }
+            return ""
+        }
+        if index > 0 && index - 1 < n {
+            val opt2 = @get(files, (index - 1) as usize)
+            if opt2 is some v2 {
+                return v2 as ref u8
+            }
+        }
+    }
+    if index < n {
         val opt = @get(files, index as usize)
         if opt is some v {
             return v as ref u8
         }
     }
-    if index > 0 && index - 1 < (@len(files) as u64) {
-        val opt2 = @get(files, (index - 1) as usize)
-        if opt2 is some v2 {
-            return v2 as ref u8
-        }
-    }
     return ""
 }
 
-fn file_for_index(info: ref DwarfInfo, index: u64) ref u8 = trust {
-    if index < (@len(info.files) as u64) {
-        val opt = @get(info.files, index as usize)
-        if opt is some v {
-            return v as ref u8
-        }
-    }
-    if index > 0 && index - 1 < (@len(info.files) as u64) {
-        val opt2 = @get(info.files, (index - 1) as usize)
-        if opt2 is some v2 {
-            return v2 as ref u8
-        }
-    }
-    return ""
+fn file_for_index(info: ref DwarfInfo, index: u64, version: u16) ref u8 = trust {
+    return line_file(info.files, index, version)
 }
 
 
@@ -1198,7 +1204,7 @@ fn build_functions(info: mut ref DwarfInfo) void = trust {
         f.display = demangle.pretty(name)
         f.low_pc = low
         f.high_pc = high
-        f.file = file_for_index(info, attr_u(die, AT_DECL_FILE))
+        f.file = file_for_index(info, attr_u(die, AT_DECL_FILE), die.cu.version)
         f.line = attr_s(die, AT_DECL_LINE)
         f.die = die
         val fb: ref DwarfAttr = attr_by_name(die, AT_FRAME_BASE)
@@ -1218,7 +1224,7 @@ fn build_functions(info: mut ref DwarfInfo) void = trust {
                 v.name = attr_str(child, AT_NAME)
                 v.source_name = demangle.source_name(v.name)
                 v.type_off = attr_type_off(child)
-                v.file = file_for_index(info, attr_u(child, AT_DECL_FILE))
+                v.file = file_for_index(info, attr_u(child, AT_DECL_FILE), die.cu.version)
                 v.line = attr_s(child, AT_DECL_LINE)
                 if loc != none && loc.is_expr {
                     v.loc_off = loc.expr_off

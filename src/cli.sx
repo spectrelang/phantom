@@ -72,6 +72,8 @@ fn print_help() void = trust {
     stdio.puts("  finish, f              step out (LLDB backend)")
     stdio.puts("  break, b <func|file:line>")
     stdio.puts("  info break             list breakpoints")
+    stdio.puts("  info line <file:line|func>")
+    stdio.puts("                         show the address for a source line")
     stdio.puts("  delete <id>            delete a breakpoint")
     stdio.puts("  locals, vars           show current local variables")
     stdio.puts("  print, p <expr>        evaluate an expression")
@@ -468,6 +470,125 @@ fn trim_expr_result(out: ref u8) ref u8 = trust {
     return line
 }
 
+fn skip_first_word(rest: ref u8) ref u8 = trust {
+    val tail: mut ref u8 = ""
+    split_word(rest, @addr(tail))
+    return tail
+}
+
+fn format_code_addr(t: ref target.Target, addr: u64) ref u8 = trust {
+    for f in t.dwarf_info.functions {
+        if addr >= f.low_pc && addr < f.high_pc {
+            if addr == f.low_pc {
+                return @fmtalloc("0x{x} <{s}>", {addr, f.display})
+            }
+            return @fmtalloc("0x{x} <{s}+{lld}>", {
+                addr, f.display, addr - f.low_pc
+            })
+        }
+    }
+    return @fmtalloc("0x{x}", {addr})
+}
+
+/// Print a gdb-style `info line` result from the loaded ELF/DWARF metadata.
+fn info_line_target(t: ref target.Target, query: ref u8) bool = trust {
+    val q: ref u8 = source_trim(query)
+    if string.len_raw(q) == 0 {
+        stdio.puts("usage: info line <file:line|function>")
+        return true
+    }
+    if @load8(q) == 42 {
+        val addr_opt = value_u64(@ptradd(q, 1))
+        if addr_opt is some addr {
+            val row: ref dwarf.DwarfLineRow = dwarf.line_for_pc(t.dwarf_info, addr)
+            if row != none && string.len_raw(row.file) > 0 {
+                stdio.print("Line {lld} of \"{s}\" is at address {s}.\n", {
+                    row.line, row.file, format_code_addr(t, addr)
+                })
+            } else {
+                stdio.print("No line information for address {s}.\n", {
+                    format_code_addr(t, addr)
+                })
+            }
+            return true
+        }
+    }
+    val colon: i64 = last_colon(q)
+    if colon > 0 {
+        val line_opt = util.parse_i64(@ptradd(q, colon + 1))
+        if line_opt is some line {
+            val file: ref u8 = util.copy_cstr_len(q, colon)
+            val addr_opt = target.line_address(t, file, line)
+            if addr_opt is some addr {
+                stdio.print("Line {lld} of \"{s}\" starts at address {s}.\n", {
+                    line, file, format_code_addr(t, addr)
+                })
+                return true
+            }
+            val near: ref dwarf.DwarfLineRow = dwarf.nearest_line_row(
+                t.dwarf_info, file, line
+            )
+            if near != none {
+                stdio.print(
+                    "Line {lld} of \"{s}\" is at address {s} but contains no code; nearest is line {lld}.\n",
+                    {
+                        line, file, format_code_addr(t, near.address), near.line
+                    }
+                )
+                return true
+            }
+            stdio.print("No line {lld} in file \"{s}\".\n", {line, file})
+            return true
+        }
+    }
+    val addr_opt = target.function_address(t, q)
+    if addr_opt is some addr {
+        val row: ref dwarf.DwarfLineRow = dwarf.line_for_pc(t.dwarf_info, addr)
+        if row != none && string.len_raw(row.file) > 0 {
+            stdio.print("Line {lld} of \"{s}\" starts at address {s}.\n", {
+                row.line, row.file, format_code_addr(t, addr)
+            })
+        } else {
+            stdio.print("Function \"{s}\" starts at address {s}.\n", {
+                q, format_code_addr(t, addr)
+            })
+        }
+        return true
+    }
+    return false
+}
+
+fn info_line_lldb(s: mut ref lldb.LldbSession, t: ref target.Target, query: ref u8) void = trust {
+    val q: ref u8 = source_trim(query)
+    if string.len_raw(q) == 0 {
+        stdio.puts("usage: info line <file:line|function>")
+        return
+    }
+    if (@len(t.dwarf_info.lines) as i64) > 0 {
+        if info_line_target(t, q) {
+            return
+        }
+    }
+    val colon: i64 = last_colon(q)
+    if colon > 0 {
+        val line_opt = util.parse_i64(@ptradd(q, colon + 1))
+        if line_opt is some line {
+            val file: ref u8 = util.copy_cstr_len(q, colon)
+            val out: ref u8 = lldb.clean_output(lldb.command(
+                s,
+                @fmtalloc("image lookup -f \"{s}\" -l {lld}", {file, line})
+            ))
+            stdio.print("{s}\n", {out})
+            return
+        }
+    }
+    val out2: ref u8 = lldb.clean_output(lldb.command(
+        s,
+        @fmtalloc("image lookup -n \"{s}\"", {q})
+    ))
+    stdio.print("{s}\n", {out2})
+}
+
 fn find_char(s: ref u8, start: i64, ch: u8) i64 = trust {
     val n: i64 = string.len_raw(s)
     val i: mut i64 = start
@@ -654,8 +775,10 @@ fn exec_lldb_command(
     } elif string.str_eql(cmd, "info") {
         if string.raw_starts_with(rest, "break") || string.raw_starts_with(rest, "b") {
             stdio.print("{s}\n", {lldb.clean_output(lldb.list_breakpoints(s))})
+        } elif string.raw_starts_with(rest, "line") {
+            info_line_lldb(s, t, skip_first_word(rest))
         } else {
-            stdio.puts("usage: info break")
+            stdio.puts("usage: info break | info line <file:line|func>")
         }
     } elif string.str_eql(cmd, "delete") || string.str_eql(cmd, "d") {
         val id_opt = util.parse_i64(rest)
@@ -796,6 +919,7 @@ fn split_args(rest: ref u8) list[ref u8] = trust {
 
 fn exec_native_command(
     s: mut ref native.NativeSession,
+    t: ref target.Target,
     cmd: ref u8,
     rest: ref u8,
     watches: mut list[ref u8],
@@ -857,8 +981,12 @@ fn exec_native_command(
     } elif string.str_eql(cmd, "info") {
         if string.raw_starts_with(rest, "break") || string.raw_starts_with(rest, "b") {
             stdio.print("{s}", {native.list_breakpoints(s)})
+        } elif string.raw_starts_with(rest, "line") {
+            if !info_line_target(t, skip_first_word(rest)) {
+                stdio.puts("No line information available.")
+            }
         } else {
-            stdio.puts("usage: info break")
+            stdio.puts("usage: info break | info line <file:line|func>")
         }
     } elif string.str_eql(cmd, "delete") || string.str_eql(cmd, "d") {
         val id_opt = util.parse_i64(rest)
@@ -911,6 +1039,7 @@ fn exec_native_command(
 }
 
 fn run_native(
+    t: ref target.Target,
     program: ref u8,
     startup_args: list[ref u8],
     batch: bool,
@@ -937,7 +1066,7 @@ fn run_native(
                 }
                 val rest: mut ref u8 = ""
                 val cmd: ref u8 = split_word(line, @addr(rest))
-                if exec_native_command(s, cmd, rest, watches, startup_args) {
+                if exec_native_command(s, t, cmd, rest, watches, startup_args) {
                     break
                 }
             }
@@ -949,7 +1078,7 @@ fn run_native(
                 }
                 val rest: mut ref u8 = ""
                 val cmd: ref u8 = split_word(line, @addr(rest))
-                if exec_native_command(s, cmd, rest, watches, startup_args) {
+                if exec_native_command(s, t, cmd, rest, watches, startup_args) {
                     break
                 }
             }
@@ -970,7 +1099,7 @@ fn run_native(
         }
         val rest: mut ref u8 = ""
         val cmd: ref u8 = split_word(line, @addr(rest))
-        if exec_native_command(s, cmd, rest, watches, startup_args) {
+        if exec_native_command(s, t, cmd, rest, watches, startup_args) {
             break
         }
     }
@@ -988,7 +1117,7 @@ pub fn run(
 ) i32 = trust {
     if string.str_eql(backend, "native") || string.str_eql(backend, "dwarf") ||
     string.str_eql(backend, "ptrace") {
-        return run_native(program, args, batch, commands)
+        return run_native(t, program, args, batch, commands)
     }
     return run_lldb(t, program, args, batch, commands)
 }

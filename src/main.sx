@@ -397,8 +397,11 @@ fn last_colon(s: ref u8) i64 = trust {
 fn usage() void = trust {
     stdio.puts("phantom - spectre debugger")
     stdio.puts("")
+    stdio.puts("usage:")
+    stdio.puts("  phantom [options] <file.sx|binary> [-- program args...]")
+    stdio.puts("  phantom debug <file.sx|binary> [options] [-- program args...]")
+    stdio.puts("")
     stdio.puts("subcommands:")
-    stdio.puts("  debug     <file.sx|binary> [options] [-- program args...]")
     stdio.puts("  dap       [options]")
     stdio.puts("  build     <file.sx> [-o <output>]")
     stdio.puts("  symbols   <binary> [query]")
@@ -597,116 +600,114 @@ pub fn main() i32 = trust {
         }
     }
 
-    if string.str_eql(first, "debug") || string.str_eql(first, "dap") {
-        val is_dap: bool = string.str_eql(first, "dap")
-        val input: mut ref u8 = ""
-        val backend: mut ref u8 = "lldb"
-        val compiler: mut ref u8 = ""
-        val program_override: mut ref u8 = ""
-        val prog_args: mut list[ref u8] = @listalloc[allocators.HeapAllocator, ref u8](util.heap())?
-        val batch: mut bool = false
-        val batch_commands: mut list[ref u8] = @listalloc[allocators.HeapAllocator, ref u8](util.heap())?
-        val i: mut i64 = 2
-        if !is_dap {
-            input = arg_at(args, 2)
-            if string.len_raw(input) == 0 || string.raw_starts_with(input, "--") {
-                stdio.puts("usage: phantom debug <file.sx|binary> [options] [-- args...]")
+    val is_dap: bool = string.str_eql(first, "dap")
+    val is_debug: bool = string.str_eql(first, "debug")
+    val input: mut ref u8 = ""
+    val backend: mut ref u8 = "lldb"
+    val compiler: mut ref u8 = ""
+    val program_override: mut ref u8 = ""
+    val prog_args: mut list[ref u8] = @listalloc[allocators.HeapAllocator, ref u8](util.heap())?
+    val batch: mut bool = false
+    val batch_commands: mut list[ref u8] = @listalloc[allocators.HeapAllocator, ref u8](util.heap())?
+    val i: mut i64 = 1
+    if is_dap || is_debug {
+        i = 2
+    }
+    val saw_separator: mut bool = false
+    for {
+        if i >= argc {
+            break
+        }
+        val a: ref u8 = arg_at(args, i)
+        if saw_separator {
+            @append(prog_args, a)
+        } elif string.str_eql(a, "--") {
+            saw_separator = true
+        } elif string.str_eql(a, "-backend") || string.str_eql(a, "-b") {
+            i++
+            backend = arg_at(args, i)
+        } elif string.str_eql(a, "-compiler") {
+            i++
+            compiler = arg_at(args, i)
+        } elif string.str_eql(a, "-program") {
+            i++
+            program_override = arg_at(args, i)
+        } elif string.str_eql(a, "-batch") || string.str_eql(a, "--batch") {
+            batch = true
+        } elif string.str_eql(a, "-ex") || string.str_eql(a, "--eval-command") {
+            i++
+            val command: ref u8 = batch_trim(arg_at(args, i))
+            if string.len_raw(command) > 0 {
+                @append(batch_commands, command)
+            }
+        } elif string.raw_starts_with(a, "--eval-command=") {
+            val command: ref u8 = batch_trim(
+                @ptradd(a, string.len_raw("--eval-command="))
+            )
+            if string.len_raw(command) > 0 {
+                @append(batch_commands, command)
+            }
+        } elif string.str_eql(a, "-x") || string.str_eql(a, "-command") {
+            i++
+            val path: ref u8 = arg_at(args, i)
+            if !batch_add_file(batch_commands, path) {
+                stdio.print("phantom: cannot read command file '{s}'\n", {path})
                 return 1
             }
-            i = 3
-        }
-        val saw_separator: mut bool = false
-        for {
-            if i >= argc {
-                break
+        } elif string.raw_starts_with(a, "-command=") {
+            val path: ref u8 = @ptradd(a, string.len_raw("-command="))
+            if !batch_add_file(batch_commands, path) {
+                stdio.print("phantom: cannot read command file '{s}'\n", {path})
+                return 1
             }
-            val a: ref u8 = arg_at(args, i)
-            if saw_separator {
-                @append(prog_args, a)
-            } elif string.str_eql(a, "--") {
-                saw_separator = true
-            } elif string.str_eql(a, "-backend") || string.str_eql(a, "-b") {
-                i++
-                backend = arg_at(args, i)
-            } elif string.str_eql(a, "-compiler") {
-                i++
-                compiler = arg_at(args, i)
-            } elif string.str_eql(a, "-program") {
-                i++
-                program_override = arg_at(args, i)
-            } elif string.str_eql(a, "-batch") || string.str_eql(a, "--batch") {
-                batch = true
-            } elif string.str_eql(a, "-ex") || string.str_eql(a, "--eval-command") {
-                i++
-                val command: ref u8 = batch_trim(arg_at(args, i))
-                if string.len_raw(command) > 0 {
-                    @append(batch_commands, command)
-                }
-            } elif string.raw_starts_with(a, "--eval-command=") {
-                val command: ref u8 = batch_trim(
-                    @ptradd(a, string.len_raw("--eval-command="))
-                )
-                if string.len_raw(command) > 0 {
-                    @append(batch_commands, command)
-                }
-            } elif string.str_eql(a, "-x") || string.str_eql(a, "-command") {
-                i++
-                val path: ref u8 = arg_at(args, i)
-                if !batch_add_file(batch_commands, path) {
-                    stdio.print("phantom: cannot read command file '{s}'\n", {path})
-                    return 1
-                }
-            } elif string.raw_starts_with(a, "-command=") {
-                val path: ref u8 = @ptradd(a, string.len_raw("-command="))
-                if !batch_add_file(batch_commands, path) {
-                    stdio.print("phantom: cannot read command file '{s}'\n", {path})
-                    return 1
-                }
-            } else {
-                if !is_dap {
-                    stdio.print("phantom: unknown option '{s}'\n", {a})
-                    return 1
+        } else {
+            if !is_dap {
+                if string.len_raw(input) == 0 {
+                    input = a
+                } else {
+                    @append(prog_args, a)
                 }
             }
-            i++
         }
-        val comp: ref u8 = find_compiler(compiler)
-        if is_dap {
-            return dap.run(comp, backend, program_override, prog_args)
+        i++
+    }
+    val comp: ref u8 = find_compiler(compiler)
+    if is_dap {
+        return dap.run(comp, backend, program_override, prog_args)
+    }
+    if string.len_raw(input) == 0 {
+        stdio.puts("usage: phantom [options] <file.sx|binary> [-- args...]")
+        stdio.puts("       phantom debug <file.sx|binary> [options] [-- args...]")
+        return 1
+    }
+    val prog = prepare_program(input, comp)
+    val program: mut ref u8 = ""
+    match prog {
+        err e => {
+            stdio.print("phantom: {s}\n", {e})
+            return 1
         }
-        val prog = prepare_program(input, comp)
-        val program: mut ref u8 = ""
-        match prog {
-            err e => {
+        ok pv => {
+            program = pv
+        }
+    }
+    val arena: allocators.Arena = allocators.Arena.new(64 * 1024 * 1024 as usize)?
+    val t_opt = load_target(arena, program)
+    val t: mut ref target.Target = none
+    match t_opt {
+        err e => {
+            if string.str_eql(backend, "native") || string.str_eql(backend, "dwarf") ||
+            string.str_eql(backend, "ptrace") {
                 stdio.print("phantom: {s}\n", {e})
                 return 1
             }
-            ok pv => {
-                program = pv
-            }
+            t = target.empty(arena, program)
         }
-        val arena: allocators.Arena = allocators.Arena.new(64 * 1024 * 1024 as usize)?
-        val t_opt = load_target(arena, program)
-        val t: mut ref target.Target = none
-        match t_opt {
-            err e => {
-                if string.str_eql(backend, "native") || string.str_eql(backend, "dwarf") ||
-                string.str_eql(backend, "ptrace") {
-                    stdio.print("phantom: {s}\n", {e})
-                    return 1
-                }
-                t = target.empty(arena, program)
-            }
-            ok tv => {
-                t = tv
-            }
+        ok tv => {
+            t = tv
         }
-        return cli.run(t, program, backend, prog_args, batch, batch_commands)
     }
-
-    stdio.print("phantom: unknown command '{s}'\n", {first})
-    usage()
-    return 1
+    return cli.run(t, program, backend, prog_args, batch, batch_commands)
 }
 
 test "batch commands trim whitespace and skip comments" {
